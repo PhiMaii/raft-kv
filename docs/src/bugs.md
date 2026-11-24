@@ -3,7 +3,52 @@
 Every real bug found by the tests is recorded here, newest first. A bug only
 counts once it has a regression test.
 
-No bugs recorded yet.
+## 2026-11-24: Removed WAL segments could come back after a crash
+
+- **Found by:** code review while writing the storage crash-point test, and
+  confirmed by that test
+  (`a_crash_at_any_point_of_a_write_recovers_a_consistent_state`): a crash
+  after 7 disk operations made recovery fail with *segment starts at i13,
+  expected i10*. Found during development, before the code was merged.
+- **Symptom:** after a crash in the middle of replacing a log suffix, the
+  node refused to start because its WAL had a gap.
+- **Root cause:** `Wal::truncate_from` removed the later segments, then
+  shortened and synced the current segment, and only then synced the
+  directory. A crash before that directory sync brought the removed segments
+  back behind an already shortened segment.
+- **Fix:** remove later segments and sync the directory first, then shorten
+  the current segment. Every crash point now leaves a prefix of the old log.
+- **Regression test:** the crash-point test above; the simulator catches the
+  old order too (3 of 1,000 seeds, see `scripts/sim-mutations.sh`).
+
+## 2026-11-24: A crash could leave entries from a term later than the node's term
+
+- **Found by:** suspicion during review, confirmed by adding the invariant
+  *current term ≥ last log term* to the storage crash-point test, which then
+  failed after 9 disk operations. Found during development, before merge.
+- **Symptom:** after a crash, a node's log ended with an entry from term 2
+  while its hard state said term 1.
+- **Root cause:** `Storage::persist` wrote the entries before the hard state.
+  A follower that learns of a new term receives the term and that term's
+  entries in the same `Ready`.
+- **Fix:** persist the hard state first.
+- **Impact:** not reachable as a safety violation in Raft, because the stale
+  node cannot win an election in any term up to the one it fell behind on;
+  the simulator never detects the old order. Fixed anyway, because the
+  invariant is cheap to keep and the opposite state is easy to misuse later.
+- **Regression test:** the term assertion in the crash-point test.
+
+## 2026-11-24: One large write did not roll over into new segments
+
+- **Found by:** unit tests (`a_missing_segment_is_an_error`,
+  `replacing_a_suffix_across_segments_is_durable`), during development.
+- **Symptom:** persisting many entries at once put all of them into one
+  segment, however large.
+- **Root cause:** the rollover check compared only the bytes already written
+  to the segment with the size limit, ignoring records still in the write
+  buffer.
+- **Fix:** count buffered bytes in the rollover check.
+- **Regression test:** the two tests above.
 
 ## Template
 

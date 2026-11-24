@@ -40,6 +40,22 @@ raft-kv is tested at four levels:
   This harness only cuts nodes off; the simulator below covers everything
   else.
 
+- **Storage tests** (`crates/storage/tests/storage.rs` and unit tests):
+  - persisting and recovering across simulated crashes, segment rollover,
+    and replacing a suffix across segments;
+  - torn and zero-filled tails are cut off; corruption in the middle, a
+    missing segment and a damaged hard state are errors;
+  - **every crash point:** a write that replaces part of the log and the
+    hard state is crashed after 0, 1, 2, … disk operations, with and without
+    partially surviving unsynced bytes. Recovery must always succeed and
+    yield the old state or a valid partial state on the way to the new one,
+    and the node's term must never be lower than its last entry's term;
+  - a property test (`proptest`) with random appends and suffix
+    replacements, then a cut at a random byte of the last segment: recovery
+    returns a prefix of the expected log and keeps everything before the cut
+    segment;
+  - the same storage on a real temporary directory.
+
 ## Deterministic simulation
 
 The `sim` crate runs a whole cluster in one process. Network, clock and
@@ -61,6 +77,12 @@ With the default settings, a run lasts 3,000 ticks (30 simulated seconds at
 | Crashes | 0.1 % per node and tick, down for 10–150 ticks, restarted from persisted state |
 | Leader crashes | 2 % per tick for the current leader |
 | Pauses | 0.1 % per node and tick, frozen for 5–60 ticks |
+| Crashes while writing | 0.2 % of writes crash after 0–7 disk operations |
+
+Nodes store their state through the real `storage` crate on a `SimDisk`. A
+crash loses everything not yet synced, except that a random part of
+unsynced appended bytes may survive, like a write that partly reached the
+disk. The node then restarts by recovering from that disk.
 
 Each seed also picks how many entries an `AppendEntries` may carry (1 to
 1,024). Small batches make followers catch up piece by piece, which opens
@@ -94,20 +116,29 @@ into `raft-core`, one at a time, and counts how many seeds detect each:
 
 | Injected bug | Seeds that caught it (of 1,000) | Detected as |
 |---|---|---|
-| Vote twice in one term | 976 | election safety |
-| Skip the election restriction | 995 | leader completeness |
-| Commit an older term's entry by counting replicas (Figure 8) | 6 | leader completeness |
-| Follower commits beyond what the leader's message proved | 2 | state machine safety |
+| Vote twice in one term | 940 | election safety |
+| Skip the election restriction | 1,000 | leader completeness |
+| Commit an older term's entry by counting replicas (Figure 8) | 7 | leader completeness |
+| Follower commits beyond what the leader's message proved | 1 | state machine safety |
+| Storage: shorten a WAL segment before removing the segments after it | 5 | recovery |
 
-The last two need rare interleavings: a leader that crashes right after its
-election, and a badly delayed message. They were not caught at all until the
-simulator gained targeted leader crashes, latency spikes and small append
-batches. At their rates, the nightly run of 10,000 seeds catches each of them
-dozens of times. Both are also covered by dedicated unit tests.
+Measured with `scripts/sim-mutations.sh 1000` on the default configuration.
 
-Not simulated yet: losing data that was written but not fsynced (comes with
-the storage layer and its `Disk` abstraction) and client-visible
-linearizability (comes with the checker).
+The Figure 8 and follower-commit bugs need rare interleavings: a leader that
+crashes right after its election, and a badly delayed message. They were not
+caught at all until the simulator gained targeted leader crashes, latency
+spikes and small append batches. Even now a single seed catches them rarely,
+so a quick local run can miss them; the nightly run of 10,000 seeds catches
+each of them about 10 to 70 times. Both are also covered by dedicated unit
+tests.
+
+Not every bug is reachable from the simulator. Writing a `Ready`'s entries
+before its hard state can leave a node whose term is lower than its last
+entry's term, but Raft's vote majority keeps that node from winning an
+election in such a term, so no seed ever turns it into a visible violation.
+The storage crash-point test checks that invariant directly instead.
+
+Not simulated yet: client-visible linearizability (comes with the checker).
 
 ### Regression seeds
 
