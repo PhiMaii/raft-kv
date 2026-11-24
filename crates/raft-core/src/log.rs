@@ -153,6 +153,72 @@ impl Log {
         &self.entries
     }
 
+    /// The stored entries from `start` to the end of the log.
+    ///
+    /// Returns an empty slice if `start` is past the end. Entries before
+    /// `first_index()` have been compacted and are not returned.
+    pub fn entries_from(&self, start: LogIndex) -> &[Entry] {
+        let start = start.max(self.first_index());
+        self.position(start)
+            .and_then(|pos| self.entries.get(pos..))
+            .unwrap_or_default()
+    }
+
+    /// The stored entries in `start..=end`, clamped to what is stored.
+    pub fn entries_between(&self, start: LogIndex, end: LogIndex) -> &[Entry] {
+        let from = self.entries_from(start);
+        let len = end
+            .0
+            .checked_sub(start.max(self.first_index()).0)
+            .and_then(|n| usize::try_from(n + 1).ok())
+            .unwrap_or(0);
+        &from[..len.min(from.len())]
+    }
+
+    /// The index of the last entry with term `term`, if any is stored.
+    pub fn last_index_of_term(&self, term: Term) -> Option<LogIndex> {
+        self.entries
+            .iter()
+            .rev()
+            .skip_while(|e| e.term > term)
+            .take_while(|e| e.term == term)
+            .map(|e| e.index)
+            .next()
+    }
+
+    /// The index of the first stored entry with the same term as the entry at
+    /// `index`, scanning backwards from `index`.
+    ///
+    /// Followers use this to tell the leader where a conflicting term starts,
+    /// so the leader can skip the whole term at once.
+    pub fn first_index_of_term_at(&self, index: LogIndex) -> Option<LogIndex> {
+        let term = self.entry(index)?.term;
+        let pos = self.position(index)?;
+        let first = self.entries[..=pos]
+            .iter()
+            .rev()
+            .take_while(|e| e.term == term)
+            .last()
+            .map_or(index, |e| e.index);
+        Some(first)
+    }
+
+    /// Removes the entry at `index` and every entry after it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is not after the snapshot: compacted entries are
+    /// committed and can never be removed.
+    pub fn truncate_from(&mut self, index: LogIndex) {
+        assert!(
+            index > self.snapshot_index,
+            "cannot truncate entries covered by the snapshot"
+        );
+        if let Some(pos) = self.position(index) {
+            self.entries.truncate(pos);
+        }
+    }
+
     /// Appends an entry to the end of the log.
     ///
     /// # Panics
@@ -255,6 +321,62 @@ mod tests {
 
         let wrong_start = Log::from_parts(LogIndex(5), Term(1), vec![entry(1, 1)]);
         assert!(wrong_start.is_err());
+    }
+
+    fn log_with_terms(terms: &[u64]) -> Log {
+        let entries = terms
+            .iter()
+            .zip(1..)
+            .map(|(&term, index)| entry(index, term))
+            .collect();
+        Log::from_parts(LogIndex(0), Term(0), entries).expect("valid log")
+    }
+
+    #[test]
+    fn entries_from_and_between_clamp_to_the_stored_range() {
+        let log = log_with_terms(&[1, 1, 2, 3]);
+        assert_eq!(log.entries_from(LogIndex(3)).len(), 2);
+        assert_eq!(log.entries_from(LogIndex(0)).len(), 4);
+        assert_eq!(log.entries_from(LogIndex(5)).len(), 0);
+        assert_eq!(log.entries_from(LogIndex(99)).len(), 0);
+
+        let between = log.entries_between(LogIndex(2), LogIndex(3));
+        assert_eq!(between, &[entry(2, 1), entry(3, 2)]);
+        assert_eq!(log.entries_between(LogIndex(3), LogIndex(99)).len(), 2);
+        assert_eq!(log.entries_between(LogIndex(3), LogIndex(2)).len(), 0);
+        assert_eq!(log.entries_between(LogIndex(1), LogIndex(0)).len(), 0);
+    }
+
+    #[test]
+    fn term_boundaries_are_found() {
+        let log = log_with_terms(&[1, 1, 2, 2, 2, 4]);
+        assert_eq!(log.last_index_of_term(Term(1)), Some(LogIndex(2)));
+        assert_eq!(log.last_index_of_term(Term(2)), Some(LogIndex(5)));
+        assert_eq!(log.last_index_of_term(Term(3)), None);
+        assert_eq!(log.last_index_of_term(Term(4)), Some(LogIndex(6)));
+
+        assert_eq!(log.first_index_of_term_at(LogIndex(5)), Some(LogIndex(3)));
+        assert_eq!(log.first_index_of_term_at(LogIndex(2)), Some(LogIndex(1)));
+        assert_eq!(log.first_index_of_term_at(LogIndex(6)), Some(LogIndex(6)));
+        assert_eq!(log.first_index_of_term_at(LogIndex(7)), None);
+    }
+
+    #[test]
+    fn truncate_removes_the_suffix() {
+        let mut log = log_with_terms(&[1, 1, 2, 2]);
+        log.truncate_from(LogIndex(3));
+        assert_eq!(log.last_index(), LogIndex(2));
+        log.truncate_from(LogIndex(10));
+        assert_eq!(log.last_index(), LogIndex(2));
+        log.append(entry(3, 5));
+        assert_eq!(log.last_term(), Term(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "snapshot")]
+    fn truncate_refuses_to_touch_the_snapshot() {
+        let mut log = Log::from_parts(LogIndex(5), Term(1), Vec::new()).expect("valid log");
+        log.truncate_from(LogIndex(5));
     }
 
     #[test]
