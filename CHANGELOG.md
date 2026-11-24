@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a `tick` / `step` / `take_ready` API that performs no I/O.
 - `raft-core`: a `Log` type that addresses entries through a snapshot offset
   from the start.
+- `raft-core`: log replication (Raft §5.3) with the consistency check, suffix
+  replacement and fast backtracking by term; the commit rule for the current
+  term (§5.4.2); a no-op entry on election; `propose`; and in-order,
+  exactly-once delivery of committed entries through `Ready`.
 - Cargo workspace with one crate per component (`raft-core`, `storage`,
   `transport`, `kv`, `server`, `client`, `sim`, `chaos`, `bench`, `cli`).
 - Documentation site (mdBook) with the specification, design overview,

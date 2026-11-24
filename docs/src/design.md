@@ -33,11 +33,18 @@ The caller interacts with a `Raft` node through three calls:
 |---|---|
 | `tick()` | One unit of logical time has passed. The caller picks the tick length (e.g. 10 ms) |
 | `step(message)` | A message from another node arrived |
-| `take_ready()` | Collect what the calls above produced: a `Ready` with the hard state to persist and the messages to send |
+| `propose(command)` | Submit a command; only the leader accepts it |
+| `take_ready()` | Collect what the calls above produced: a `Ready` with the hard state and entries to persist, the messages to send and the committed entries to apply |
 
-The caller must make `Ready::hard_state` durable **before** sending
-`Ready::messages`. Otherwise a node could promise its vote, crash, forget the
-promise and vote again in the same term.
+The caller handles a `Ready` in a fixed order:
+
+1. Make `hard_state` and `entries` durable.
+2. Send `messages`.
+3. Apply `committed_entries` to the state machine.
+
+Persisting first is what makes votes and acknowledgements binding. Otherwise
+a node could promise its vote, crash, forget the promise and vote again in
+the same term, or acknowledge an entry it then loses.
 
 All timeouts are counted in ticks, and the only randomness (election timeout
 jitter) comes from a seeded generator in the configuration. The same
@@ -78,7 +85,54 @@ anything in that state, and reads are protected by ReadIndex.
 
 ## Write path
 
-_Written in milestone 2._
+Implemented as in Raft §5.3 and §5.4.2.
+
+### On the leader
+
+- A new leader appends a **no-op entry** in its own term before anything
+  else, and sends it to every follower immediately. A leader may only commit
+  entries of its own term by counting replicas, so the no-op lets it commit
+  whatever earlier terms left behind. ReadIndex reads depend on it too.
+- `propose` appends the command to the leader's log and sends it to every
+  follower right away; it does not wait for the next heartbeat.
+- For each follower the leader tracks `next_index` (the next entry to send)
+  and `match_index` (the highest entry known to be on the follower). Every
+  `AppendEntries` carries all entries from `next_index` on, capped at
+  `max_entries_per_append`. Heartbeats are the same message, so they also
+  carry any entries a follower is still missing.
+- After a successful response the leader raises `match_index` (never lowers
+  it, since responses can be reordered) and, if the follower is still behind,
+  sends the next batch.
+- The leader **commits** the highest index stored on a majority (counting
+  itself), but only if that entry is from the current term (the Figure 8
+  rule). Earlier entries then become committed along with it.
+
+### On a follower
+
+- **Consistency check:** the follower accepts entries only if its log has an
+  entry at `prev_log_index` with `prev_log_term`.
+- **Fast backtracking:** if the check fails, the follower tells the leader
+  where to continue. If its log is too short, that is its last index + 1. If
+  the terms differ, it sends the conflicting term and the first index of that
+  term in its log. The leader then jumps past its own entries of that term,
+  or straight to the hint if it has none, skipping a whole term per round
+  trip instead of one entry.
+- **Appending:** entries already present with the same term are kept. The
+  first entry with a different term and everything after it are replaced.
+  This way a delayed or duplicated message can never remove entries that a
+  newer message added. Overwriting a committed entry would violate Raft's
+  safety argument; the node panics instead of doing it.
+- **Commit:** the follower sets its commit index to
+  `min(leader_commit, last index of this message)`. Entries after what the
+  message proved may still differ from the leader's log, so they are not
+  committed yet.
+
+### Applying
+
+Every node hands committed entries to the state machine through
+`Ready::committed_entries`, strictly in order and exactly once. The commit
+index is not persisted: after a restart it begins at the snapshot index and
+catches up from the leader's next message.
 
 ## Read path
 
