@@ -340,6 +340,8 @@ fn leader_steps_down_on_a_higher_term() {
         MessageBody::AppendEntriesResponse {
             success: false,
             match_index: LogIndex(0),
+            conflict_index: LogIndex(0),
+            conflict_term: None,
         },
     ));
     assert_eq!(raft.role(), Role::Follower);

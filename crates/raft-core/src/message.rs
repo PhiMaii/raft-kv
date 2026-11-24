@@ -47,8 +47,15 @@ pub enum MessageBody {
     AppendEntriesResponse {
         /// Whether the follower's log matched at `prev_log_index`.
         success: bool,
-        /// On success, the index up to which the follower's log now matches
-        /// the leader's.
+        /// On success, the index up to which the follower's log is now known
+        /// to match the leader's. Zero on failure.
         match_index: LogIndex,
+        /// On failure, where the leader should try next: the first index of
+        /// `conflict_term` in the follower's log, or the follower's last
+        /// index + 1 if its log is too short. Zero on success.
+        conflict_index: LogIndex,
+        /// On failure, the term of the follower's entry at `prev_log_index`,
+        /// if it has one. Lets the leader skip a whole term at once.
+        conflict_term: Option<Term>,
     },
 }
