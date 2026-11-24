@@ -16,6 +16,16 @@ raft-kv is tested at four levels:
 4. **Real-process fault injection**: five real server processes with
    `kill -9`, paused processes and network partitions.
 
+## Current coverage
+
+- **`raft-core` unit tests** (`crates/raft-core/tests/election.rs`): every
+  election transition, driven with hand-written messages. They cover vote
+  granting and the election restriction, stepping down on higher terms,
+  stale messages, heartbeats, split votes, and restoring from persisted state.
+- **In-memory cluster tests** (`crates/raft-core/tests/cluster.rs`): 3- and
+  5-node clusters across hundreds of seeds elect exactly one leader, re-elect
+  after the leader is cut off, and never elect a leader in a minority.
+
 ## Running the tests
 
 ```sh
