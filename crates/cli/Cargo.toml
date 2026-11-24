@@ -1,0 +1,16 @@
+[package]
+name = "cli"
+description = "Command-line entry point: run a node, issue requests, run benchmarks and chaos tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "raft-kv"
+path = "src/main.rs"
+
+[lints]
+workspace = true

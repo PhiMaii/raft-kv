@@ -198,7 +198,7 @@ The simulator tests the algorithm. This harness tests the real binary, network a
 
 ### 3.5 Bug log
 
-Keep `docs/bugs.md` from day one. For each bug, record:
+Keep `docs/src/bugs.md` from day one. For each bug, record:
 - how it was found (simulation seed, chaos run, test)
 - the symptom
 - the root cause

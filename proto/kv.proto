@@ -1,0 +1,13 @@
+// Client-facing key-value API.
+//
+// Messages are defined in milestone 7 (gRPC transport). See
+// docs/src/spec.md, section 2.8.
+
+syntax = "proto3";
+
+package raftkv.kv.v1;
+
+service KeyValue {
+  // RegisterClient, Put, Get, Delete and CompareAndSwap are added in
+  // milestone 7.
+}
