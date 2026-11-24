@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 # Checks that the simulator catches known Raft bugs.
 #
-# Each mutation injects one classic bug into raft-core, runs the simulator
-# over a range of seeds, and reports how many seeds detected it. The source
-# file is restored afterwards, also on failure or Ctrl-C.
+# Each mutation injects one known bug into raft-core or the storage layer,
+# runs the simulator over a range of seeds, and reports how many seeds
+# detected it. Source files are restored afterwards, also on failure or
+# Ctrl-C.
 #
 # Usage: scripts/sim-mutations.sh [seeds]   (default: 1000)
 
 set -euo pipefail
 
 SEEDS="${1:-1000}"
-FILE="crates/raft-core/src/raft.rs"
+RAFT="crates/raft-core/src/raft.rs"
+WAL="crates/storage/src/wal.rs"
+FILES=("$RAFT" "$WAL")
 cd "$(git rev-parse --show-toplevel)"
 
-if ! git diff --quiet -- "$FILE"; then
-  echo "error: $FILE has uncommitted changes; commit or stash them first" >&2
+if ! git diff --quiet -- "${FILES[@]}"; then
+  echo "error: mutated files have uncommitted changes; commit or stash them first" >&2
   exit 1
 fi
-trap 'git checkout -q -- "$FILE"' EXIT
+trap 'git checkout -q -- "${FILES[@]}"' EXIT
 
 mutate() {
-  local name="$1" from="$2" to="$3"
-  FROM="$from" TO="$to" python3 - "$FILE" <<'EOF'
+  local file="$1" name="$2" from="$3" to="$4"
+  FROM="$from" TO="$to" python3 - "$file" <<'EOF'
 import os, sys
 path = sys.argv[1]
 text = open(path).read()
@@ -40,15 +43,32 @@ EOF
   failed="$(grep -o '[0-9]* failed' <<<"$output" | head -1)"
   kind="$(grep -m1 -o 'violated [a-z ]* at' <<<"$output" | sed 's/violated //; s/ at$//' || true)"
   printf '%-45s %-12s %s\n' "$name" "$failed" "${kind:--}"
-  git checkout -q -- "$FILE"
+  git checkout -q -- "$file"
 }
 
 printf '%-45s %-12s %s\n' "mutation" "seeds" "first violation"
-mutate "vote twice in one term" \
+mutate "$RAFT" "vote twice in one term" \
   'let granted = can_vote && log_ok;' 'let granted = log_ok;'
-mutate "skip the election restriction" \
+mutate "$RAFT" "skip the election restriction" \
   'let granted = can_vote && log_ok;' 'let granted = can_vote;'
-mutate "commit older terms by counting (Figure 8)" \
+mutate "$RAFT" "commit older terms by counting (Figure 8)" \
   '&& self.log.term_at(majority_index) == Some(self.current_term)' ''
-mutate "follower commits beyond the proven prefix" \
+mutate "$RAFT" "follower commits beyond the proven prefix" \
   'let new_commit = leader_commit.min(last_new_index);' 'let new_commit = leader_commit;'
+mutate "$WAL" "shorten a segment before removing later ones" \
+  'disk.remove(&later.name)?;
+        }
+        if !removed.is_empty() {
+            disk.sync_dir()?;
+        }
+        let current = &mut self.segments[segment];
+        disk.truncate(&current.name, offset)?;
+        disk.sync(&current.name)?;' \
+  'disk.remove(&later.name)?;
+        }
+        let current = &mut self.segments[segment];
+        disk.truncate(&current.name, offset)?;
+        disk.sync(&current.name)?;
+        if !removed.is_empty() {
+            disk.sync_dir()?;
+        }'

@@ -53,6 +53,9 @@ pub struct FaultConfig {
     /// behind Raft's subtler bugs (such as Figure 8 in the paper), which
     /// uniformly random crashes almost never hit.
     pub leader_crash: Chance,
+    /// Chance that a node crashes while persisting a `Ready`, at a random
+    /// point of the write sequence. Whatever was not yet synced is lost.
+    pub write_crash: Chance,
     /// How long a crashed node stays down, in ticks: `(min, max)`.
     pub downtime: (u64, u64),
     /// Chance per tick, per running node, that the node pauses, as if its
@@ -77,6 +80,7 @@ impl FaultConfig {
             heal: Chance::NEVER,
             crash: Chance::NEVER,
             leader_crash: Chance::NEVER,
+            write_crash: Chance::NEVER,
             downtime: (1, 1),
             pause: Chance::NEVER,
             pause_length: (1, 1),
@@ -99,6 +103,7 @@ impl Default for FaultConfig {
             heal: Chance::percent(4),
             crash: Chance::per_million(1_000),
             leader_crash: Chance::percent(2),
+            write_crash: Chance::per_million(2_000),
             downtime: (10, 150),
             pause: Chance::per_million(1_000),
             pause_length: (5, 60),

@@ -14,8 +14,12 @@ pub struct Stats {
     pub messages_duplicated: u64,
     /// Partitions started.
     pub partitions: u64,
-    /// Node crashes.
+    /// Node crashes, including crashes while writing.
     pub crashes: u64,
+    /// Crashes in the middle of persisting a `Ready`.
+    pub write_crashes: u64,
+    /// Unsynced bytes lost in crashes.
+    pub bytes_lost: u64,
     /// Node pauses.
     pub pauses: u64,
     /// Distinct `(term, leader)` pairs observed.
@@ -54,6 +58,8 @@ pub enum ViolationKind {
     StateMachineSafety,
     /// After all faults were healed, the cluster did not converge.
     Liveness,
+    /// A node could not recover its state from disk after a crash.
+    Recovery,
     /// A node panicked, for example on an internal assertion.
     Panic,
 }
@@ -66,6 +72,7 @@ impl fmt::Display for ViolationKind {
             Self::LeaderCompleteness => "leader completeness",
             Self::StateMachineSafety => "state machine safety",
             Self::Liveness => "liveness",
+            Self::Recovery => "recovery",
             Self::Panic => "panic",
         };
         f.write_str(name)
