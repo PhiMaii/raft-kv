@@ -1,0 +1,47 @@
+name: Simulation (nightly)
+
+# Runs far more simulation seeds than the regular test suite. Every night
+# starts at a new offset, so the seed space covered keeps growing. A failing
+# seed is printed together with the command that reproduces it.
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Number of seeds to run
+        default: "10000"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  simulate:
+    name: Simulate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run seeds
+        env:
+          SEEDS: ${{ github.event.inputs.seeds || '10000' }}
+          START: ${{ github.run_number }}
+        run: |
+          start=$(( START * 1000000 ))
+          cargo run -q -p sim --release -- --seeds "$SEEDS" --start "$start" \
+            2>&1 | tee sim.log
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Simulation'
+            echo '```'
+            tail -n 40 sim.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
