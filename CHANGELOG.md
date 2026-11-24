@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementation.
 - `sim`: nodes persist through the storage crate on a `SimDisk` and can
   crash in the middle of a write, losing unsynced data.
+- `kv`: the key-value state machine with put, delete, compare-and-swap and
+  log reads; client sessions that deduplicate retries; deterministic
+  session expiry by leader timestamps (ADR 0004); key and value size limits;
+  and a versioned binary encoding for commands in the log.
 - Cargo workspace with one crate per component (`raft-core`, `storage`,
   `transport`, `kv`, `server`, `client`, `sim`, `chaos`, `bench`, `cli`).
 - Documentation site (mdBook) with the specification, design overview,

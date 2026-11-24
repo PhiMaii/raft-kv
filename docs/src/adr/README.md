@@ -10,3 +10,4 @@ accepted; a later ADR supersedes it instead.
 | [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Accepted |
 | [0002](0002-io-free-raft-core.md) | Deterministic, I/O-free Raft core | Accepted |
 | [0003](0003-readindex-over-leases.md) | ReadIndex instead of leader leases | Accepted |
+| [0004](0004-session-expiry-by-leader-timestamps.md) | Expire client sessions by leader timestamps | Accepted |

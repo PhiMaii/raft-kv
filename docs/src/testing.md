@@ -56,6 +56,19 @@ raft-kv is tested at four levels:
     segment;
   - the same storage on a real temporary directory.
 
+- **Key-value state machine tests** (`crates/kv/tests/store.rs`):
+  - every operation, compare-and-swap with and without an expected value;
+  - retries get the original answer and are not applied again; delayed
+    older requests and unknown sessions are rejected;
+  - idle sessions expire by leader timestamps, active ones do not, and a
+    leader clock behind the previous one does not move time backwards;
+  - size limits, and malformed entries rejected without changing state;
+  - **property tests**: random workloads with retries must behave exactly
+    like a plain map where each request is applied once, and two stores fed
+    the same log must end up identical; arbitrary bytes never panic; every
+    command survives encoding. Disabling deduplication makes the first of
+    these fail immediately.
+
 ## Deterministic simulation
 
 The `sim` crate runs a whole cluster in one process. Network, clock and
