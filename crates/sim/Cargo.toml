@@ -8,5 +8,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "raft-kv-sim"
+path = "src/main.rs"
+
+[dependencies]
+raft-core = { path = "../raft-core" }
+
 [lints]
 workspace = true

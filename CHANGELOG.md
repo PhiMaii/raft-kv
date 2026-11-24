@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement and fast backtracking by term; the commit rule for the current
   term (§5.4.2); a no-op entry on election; `propose`; and in-order,
   exactly-once delivery of committed entries through `Ready`.
+- `sim`: deterministic, seed-driven cluster simulator with message loss,
+  duplication, delay and latency spikes, symmetric and asymmetric
+  partitions, crashes with restart from persisted state, targeted leader
+  crashes and pauses. Checks election safety, log matching, leader
+  completeness and state machine safety on every tick, and convergence
+  after healing.
+- `raft-kv-sim` binary to run many seeds, a regression seed list, a nightly
+  CI job running 10,000 seeds, and `scripts/sim-mutations.sh` to check that
+  the simulator detects injected Raft bugs.
 - Cargo workspace with one crate per component (`raft-core`, `storage`,
   `transport`, `kv`, `server`, `client`, `sim`, `chaos`, `bench`, `cli`).
 - Documentation site (mdBook) with the specification, design overview,
