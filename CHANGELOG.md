@@ -43,3 +43,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation site (mdBook) with the specification, design overview,
   architecture decision records, testing methodology and bug log.
 - CI: formatting, Clippy, tests, dependency audit and documentation build.
+- Documentation site on GitHub Pages, published from `main`, with the
+  mdBook and the API reference.

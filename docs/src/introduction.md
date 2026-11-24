@@ -14,7 +14,9 @@ This book collects everything needed to understand and check the system:
 - the **[benchmarks](benchmarks.md)**, each with the command and hardware
   needed to reproduce it;
 - the **[bug log](bugs.md)**: every real bug the tests found, with its root
-  cause, fix and regression test.
+  cause, fix and regression test;
+- the **API reference** generated from the code, starting at
+  [`raft_core`](api/raft_core/index.html) (only on the published site).
 
 The project is a work in progress. Pages describe the current state of the
 code; planned work is marked as such.
