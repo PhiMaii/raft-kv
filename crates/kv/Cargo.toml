@@ -1,0 +1,12 @@
+[package]
+name = "kv"
+description = "The key-value state machine with client sessions and request deduplication."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
