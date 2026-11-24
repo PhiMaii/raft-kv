@@ -53,8 +53,19 @@ _TBD (milestone 9)._
 
 ## Testing
 
-_TBD._ The testing approach is described in the
-[specification](docs/src/spec.md#3-verification-proving-the-websites-claims).
+The main correctness tool is a deterministic simulator: whole clusters run
+in one process under message loss, reordering, partitions, crashes and
+pauses, all driven by one seed, while Raft's safety properties are checked
+on every tick. Any failing seed reproduces exactly.
+
+```sh
+cargo nextest run --workspace                     # unit, cluster and simulation tests
+cargo run -p sim --release -- --seeds 10000       # 10,000 simulation seeds
+scripts/sim-mutations.sh                          # does the simulator catch injected bugs?
+```
+
+See [Testing methodology](docs/src/testing.md) for the fault model, the
+invariants, and how the simulator was checked against known Raft bugs.
 
 ## Results
 
