@@ -1,0 +1,8 @@
+# Seeds that once failed a simulation run, kept as permanent regression tests.
+#
+# One seed per line. Add a short comment with the bug it reproduced and a
+# link to its entry in docs/src/bugs.md, for example:
+#
+#   12345  # stale leader served a read (bugs.md, 2026-12-01)
+#
+# These seeds run with the default `SimConfig` on every `cargo test`.
