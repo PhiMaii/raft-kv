@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/PhiMaii/raft-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/PhiMaii/raft-kv/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Docs](https://img.shields.io/badge/docs-phimaii.github.io%2Fraft--kv-informational.svg)](https://phimaii.github.io/raft-kv/)
 
 A replicated, linearizable key-value store built from scratch on the
 [Raft](https://raft.github.io/) consensus algorithm, written in Rust.
@@ -71,6 +72,12 @@ invariants, and how the simulator was checked against known Raft bugs.
 
 _TBD._ Every number published here will come with the exact command and the
 hardware it was measured on, so it can be reproduced from this repository.
+
+## Documentation
+
+The [documentation site](https://phimaii.github.io/raft-kv/) has the
+specification, the design, the testing methodology, the architecture
+decision records, the bug log, and the [API reference](https://phimaii.github.io/raft-kv/api/raft_core/).
 
 ## License
 

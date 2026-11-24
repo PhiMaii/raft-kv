@@ -29,7 +29,9 @@ mdbook build docs
 
 ## Branches and pull requests
 
-- `main` is always green. All work lands through pull requests.
+- `main` is always green. It is protected: all work lands through pull
+  requests, and the CI checks (Format, Clippy, Test, Dependencies, Docs)
+  must pass before merging. Force pushes are not allowed.
 - Branch names: `feat/<slug>`, `fix/<slug>`, `docs/<slug>`, `ci/<slug>`,
   `chore/<slug>`.
 - One pull request per milestone step from the
