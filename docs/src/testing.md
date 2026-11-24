@@ -22,9 +22,23 @@ raft-kv is tested at four levels:
   election transition, driven with hand-written messages. They cover vote
   granting and the election restriction, stepping down on higher terms,
   stale messages, heartbeats, split votes, and restoring from persisted state.
-- **In-memory cluster tests** (`crates/raft-core/tests/cluster.rs`): 3- and
-  5-node clusters across hundreds of seeds elect exactly one leader, re-elect
-  after the leader is cut off, and never elect a leader in a minority.
+- **`raft-core` replication tests** (`crates/raft-core/tests/replication.rs`):
+  the leader's no-op, proposals, the commit rule including Raft's Figure 8
+  case, fast backtracking in all three variants, follower consistency checks,
+  suffix replacement, late duplicate messages, and commit index bounds.
+- **In-memory cluster tests** (`crates/raft-core/tests/cluster.rs`):
+  - 3- and 5-node clusters across hundreds of seeds elect exactly one leader,
+    re-elect after the leader is cut off, and never elect a leader in a
+    minority;
+  - proposals reach every node and are applied in the same order;
+  - a cut-off leader's uncommitted entries are replaced after the partition
+    heals;
+  - a small fuzz run (100 seeds × 1,500 steps) cuts off random nodes while
+    proposals keep coming, and checks **log matching** and **state machine
+    safety** after every step.
+
+  This harness only cuts nodes off. Message loss, delay, reordering,
+  duplication and crashes come with the simulator (milestone 3).
 
 ## Running the tests
 

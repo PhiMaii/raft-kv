@@ -22,6 +22,9 @@ pub struct Config {
     pub election_timeout_max: u64,
     /// How often a leader sends heartbeats.
     pub heartbeat_interval: u64,
+    /// The most entries a single `AppendEntries` message may carry, so a
+    /// follower that is far behind catches up in bounded steps.
+    pub max_entries_per_append: usize,
     /// Seed for the node's random number generator, which only picks
     /// election timeouts. The same seed always gives the same behaviour.
     pub seed: u64,
@@ -38,6 +41,7 @@ impl Config {
             election_timeout_min: 15,
             election_timeout_max: 30,
             heartbeat_interval: 5,
+            max_entries_per_append: 1024,
             seed,
         }
     }
@@ -60,6 +64,9 @@ impl Config {
         if self.heartbeat_interval >= self.election_timeout_min {
             return Err(ConfigError::HeartbeatNotShorterThanElectionTimeout);
         }
+        if self.max_entries_per_append == 0 {
+            return Err(ConfigError::ZeroMaxEntriesPerAppend);
+        }
         Ok(())
     }
 }
@@ -77,6 +84,8 @@ pub enum ConfigError {
     EmptyElectionTimeoutRange,
     /// Heartbeats would not arrive before followers start elections.
     HeartbeatNotShorterThanElectionTimeout,
+    /// `max_entries_per_append` is zero.
+    ZeroMaxEntriesPerAppend,
 }
 
 impl fmt::Display for ConfigError {
@@ -91,6 +100,7 @@ impl fmt::Display for ConfigError {
             Self::HeartbeatNotShorterThanElectionTimeout => {
                 "heartbeat interval must be shorter than the minimum election timeout"
             }
+            Self::ZeroMaxEntriesPerAppend => "max entries per append must be at least one",
         };
         f.write_str(message)
     }
@@ -128,11 +138,15 @@ mod tests {
         c.election_timeout_max = c.election_timeout_min;
         assert_eq!(c.validate(), Err(ConfigError::EmptyElectionTimeoutRange));
 
-        let mut c = base;
+        let mut c = base.clone();
         c.heartbeat_interval = c.election_timeout_min;
         assert_eq!(
             c.validate(),
             Err(ConfigError::HeartbeatNotShorterThanElectionTimeout)
         );
+
+        let mut c = base;
+        c.max_entries_per_append = 0;
+        assert_eq!(c.validate(), Err(ConfigError::ZeroMaxEntriesPerAppend));
     }
 }
