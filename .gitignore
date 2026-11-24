@@ -1,0 +1,30 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Coverage and profiling
+*.profraw
+*.profdata
+/coverage/
+flamegraph.svg
+perf.data*
+
+# Generated docs site
+/docs/book/
+
+# Local cluster data and run artifacts
+/data/
+/chaos-runs/
+/bench/results/*.local.*
+
+# Environment and secrets
+.env
+.env.*
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
