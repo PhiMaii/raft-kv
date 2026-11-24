@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `raft-kv-sim` binary to run many seeds, a regression seed list, a nightly
   CI job running 10,000 seeds, and `scripts/sim-mutations.sh` to check that
   the simulator detects injected Raft bugs.
+- `storage`: write-ahead log in checksummed, size-limited segment files, an
+  atomically replaced hard state file, and crash recovery that cuts off torn
+  tails but refuses to start on any other damage. All file access goes
+  through a `Disk` trait with a real (`FsDisk`) and a simulated (`SimDisk`)
+  implementation.
+- `sim`: nodes persist through the storage crate on a `SimDisk` and can
+  crash in the middle of a write, losing unsynced data.
 - Cargo workspace with one crate per component (`raft-core`, `storage`,
   `transport`, `kv`, `server`, `client`, `sim`, `chaos`, `bench`, `cli`).
 - Documentation site (mdBook) with the specification, design overview,

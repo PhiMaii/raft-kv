@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 raft-core = { path = "../raft-core" }
+storage = { path = "../storage" }
 
 [lints]
 workspace = true

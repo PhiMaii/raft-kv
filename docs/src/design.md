@@ -141,7 +141,62 @@ for the decision.
 
 ## Storage and recovery
 
-_Written in milestone 4._
+The `storage` crate makes a `Ready`'s hard state and entries durable before
+`persist` returns. All file access goes through a `Disk` trait: `FsDisk` uses
+a real directory, and `SimDisk` keeps files in memory and loses every
+unsynced change on a simulated crash.
+
+### Files
+
+| File | Contents |
+|---|---|
+| `00000000000000000001.wal`, … | WAL segments, each named after the index of its first entry |
+| `hardstate` | Current term and vote |
+| `hardstate.tmp` | Only exists briefly while the hard state is replaced |
+
+A WAL record is `len: u32 | crc32: u32 | payload`, where the payload is an
+encoded entry: index, term, kind (no-op or command) and the command bytes. A
+new segment starts once the current one would exceed `segment_size` (64 MiB
+by default).
+
+### Write order
+
+`persist` writes in this order, and every step is synced before the next:
+
+1. **Hard state**, replaced atomically: write `hardstate.tmp`, sync it,
+   rename it over `hardstate`, sync the directory. A crash leaves either the
+   old or the new hard state, never a mix.
+2. **Replaced entries**, if the new entries overwrite part of the log:
+   remove later segments and sync the directory, *then* shorten the segment
+   that holds the first replaced entry and sync it. In the opposite order, a
+   crash could bring the removed segments back after a shortened one, a gap
+   recovery cannot accept.
+3. **New entries**, appended to the current segment (or a new one, followed
+   by a directory sync) and synced.
+
+The hard state goes first because a node that learns of a new term gets the
+term and that term's entries in the same `Ready`. Written the other way
+round, a crash in between would leave entries from a later term than the
+node's current term.
+
+On macOS and iOS, `std::fs::File::sync_all` issues `F_FULLFSYNC`, so data
+reaches stable storage and not just the drive's cache.
+
+### Recovery
+
+On startup, `Storage::open`:
+
+- removes a leftover `hardstate.tmp` (its rename never happened);
+- reads and checks the hard state, and fails if it is damaged;
+- reads every segment in order and checks that segment names and entry
+  indices are contiguous;
+- treats an invalid record at the **end of the last segment** as an
+  interrupted write and cuts it off. A record counts as torn if it runs past
+  the end of the file, is the last thing in the file, or is followed only by
+  zeros (space the file system allocated but never wrote);
+- fails with `StorageError::Corrupt` on any other damage, such as an invalid
+  record with valid data after it, or a missing segment. Skipping damaged
+  entries silently could lose acknowledged writes.
 
 ## Snapshots
 

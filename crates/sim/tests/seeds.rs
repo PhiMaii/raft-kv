@@ -41,6 +41,8 @@ fn random_seeds_pass_under_faults() {
     // made progress.
     let total = |f: fn(&Stats) -> u64| stats.iter().map(f).sum::<u64>();
     assert!(total(|s| s.crashes) > 0, "no crashes injected");
+    assert!(total(|s| s.write_crashes) > 0, "no crashes during writes");
+    assert!(total(|s| s.bytes_lost) > 0, "no unsynced data lost");
     assert!(total(|s| s.pauses) > 0, "no pauses injected");
     assert!(total(|s| s.partitions) > 0, "no partitions injected");
     assert!(total(|s| s.messages_dropped) > 0, "no messages dropped");
@@ -52,9 +54,13 @@ fn random_seeds_pass_under_faults() {
         stats.iter().all(|s| s.leaders_elected > 1),
         "every run should see leader changes"
     );
+    let mut committed: Vec<u64> = stats.iter().map(|s| s.committed_index).collect();
+    committed.sort_unstable();
+    let median = committed[committed.len() / 2];
     assert!(
-        stats.iter().all(|s| s.committed_index > 100),
-        "every run should commit a meaningful number of entries"
+        committed[0] > 50 && median > 150,
+        "runs should commit a meaningful number of entries: min {}, median {median}",
+        committed[0]
     );
 }
 

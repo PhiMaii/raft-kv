@@ -3,9 +3,8 @@
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 
-use raft_core::{
-    Config, Entry, HardState, Log, LogIndex, NodeId, ProposeError, Raft, Ready, Role, Term,
-};
+use raft_core::{Config, Log, LogIndex, NodeId, ProposeError, Raft, Role, Term};
+use storage::{SimDisk, Storage, StorageOptions};
 
 use crate::config::SimConfig;
 use crate::invariants::{Checker, Failure};
@@ -16,43 +15,22 @@ use crate::rng::SimRng;
 /// How many recent events a violation report includes.
 const TRACE_LEN: usize = 60;
 
-/// What a node keeps on disk. Every `Ready` is persisted in full before its
-/// messages are sent, so a crash loses nothing that was persisted.
-///
-/// Crashes that lose data written but not yet fsynced are simulated once the
-/// storage layer with its `Disk` abstraction exists.
-#[derive(Clone, Debug, Default)]
-struct Storage {
-    hard_state: HardState,
-    entries: Vec<Entry>,
-}
-
-impl Storage {
-    fn persist(&mut self, ready: &Ready) {
-        if let Some(hard_state) = ready.hard_state {
-            self.hard_state = hard_state;
-        }
-        if let Some(first) = ready.entries.first() {
-            let keep = usize::try_from(first.index.0 - 1).expect("index fits in usize");
-            self.entries.truncate(keep);
-            self.entries.extend(ready.entries.iter().cloned());
-        }
-    }
-
-    fn log(&self) -> Log {
-        Log::from_parts(LogIndex(0), Term(0), self.entries.clone()).expect("persisted log is valid")
-    }
-}
+/// Small WAL segments, so that runs exercise segment rollover and
+/// truncation across segment boundaries.
+const STORAGE: StorageOptions = StorageOptions { segment_size: 2048 };
 
 #[derive(Debug)]
 enum State {
     Up {
         raft: Box<Raft>,
+        storage: Box<Storage<SimDisk>>,
         /// The node is paused (receives and does nothing) until this tick.
         paused_until: Option<u64>,
     },
     Down {
         restart_at: u64,
+        /// The disk as it survived the crash.
+        disk: Box<SimDisk>,
     },
 }
 
@@ -61,7 +39,6 @@ struct Node {
     id: NodeId,
     config: Config,
     state: State,
-    storage: Storage,
     /// The commit index last observed, to detect when a leader advances it.
     observed_commit: LogIndex,
     restarts: u64,
@@ -111,14 +88,16 @@ impl Simulation {
                 let mut raft_config = Config::new(id, peers, rng.next_u64());
                 raft_config.max_entries_per_append = max_entries_per_append;
                 let raft = Raft::new(raft_config.clone()).expect("valid raft config");
+                let (storage, _) =
+                    Storage::open(SimDisk::new(), STORAGE).expect("empty disk opens");
                 Node {
                     id,
                     config: raft_config,
                     state: State::Up {
                         raft: Box::new(raft),
+                        storage: Box::new(storage),
                         paused_until: None,
                     },
-                    storage: Storage::default(),
                     observed_commit: LogIndex(0),
                     restarts: 0,
                 }
@@ -181,7 +160,7 @@ impl Simulation {
     /// One unit of simulated time.
     fn tick(&mut self, with_workload: bool) -> Result<(), Failure> {
         self.now += 1;
-        self.restart_due_nodes();
+        self.restart_due_nodes()?;
         self.deliver_messages();
         for node in &mut self.nodes {
             if node.is_active(self.now) {
@@ -257,15 +236,33 @@ impl Simulation {
     }
 
     /// Persists, sends and applies each node's `Ready`, and checks the
-    /// invariants against what changed.
+    /// invariants against what changed. A node may crash in the middle of
+    /// persisting; it then sends and applies nothing.
     fn process_readies(&mut self) -> Result<(), Failure> {
         for i in 0..self.nodes.len() {
             let node = &mut self.nodes[i];
-            let State::Up { raft, .. } = &mut node.state else {
+            let State::Up { raft, storage, .. } = &mut node.state else {
                 continue;
             };
             let ready = raft.take_ready();
-            node.storage.persist(&ready);
+            if self.rng.chance(self.config.faults.write_crash) {
+                let ops = self.rng.below(8);
+                storage.disk_mut().fail_after(ops);
+            }
+            if let Err(error) = storage.persist(&ready) {
+                if !storage.disk().has_failed() {
+                    return Err((ViolationKind::Recovery, format!("{}: {error}", node.id)));
+                }
+                let downtime = self.config.faults.downtime;
+                let restart_at = self.now + self.rng.between(downtime.0, downtime.1);
+                self.stats.write_crashes += 1;
+                self.crash(i, restart_at);
+                let id = self.nodes[i].id;
+                self.event(&format!(
+                    "{id} crashed while writing, until tick {restart_at}"
+                ));
+                continue;
+            }
 
             let id = node.id;
             let (role, term, commit) = (raft.role(), raft.term(), raft.commit_index());
@@ -298,6 +295,34 @@ impl Simulation {
         Ok(())
     }
 
+    /// Stops node `i` until `restart_at`. Everything its disk had not synced
+    /// is lost, except that a random part of unsynced appends may survive,
+    /// like a write that partly reached the disk.
+    fn crash(&mut self, i: usize, restart_at: u64) {
+        self.stats.crashes += 1;
+        let placeholder = State::Down {
+            restart_at,
+            disk: Box::default(),
+        };
+        let State::Up { storage, .. } = std::mem::replace(&mut self.nodes[i].state, placeholder)
+        else {
+            return;
+        };
+        let mut disk = storage.into_disk();
+        let rng = &mut self.rng;
+        let mut lost = 0;
+        disk.crash(&mut |unsynced| {
+            let kept = rng.below(unsynced + 1);
+            lost += unsynced - kept;
+            kept
+        });
+        self.stats.bytes_lost += lost;
+        self.nodes[i].state = State::Down {
+            restart_at,
+            disk: Box::new(disk),
+        };
+    }
+
     fn inject_faults(&mut self) {
         let faults = self.config.faults.clone();
         if self.network.is_partitioned() && self.rng.chance(faults.heal) {
@@ -321,8 +346,7 @@ impl Simulation {
             };
             if self.rng.chance(crash) {
                 let restart_at = self.now + self.rng.between(faults.downtime.0, faults.downtime.1);
-                self.nodes[i].state = State::Down { restart_at };
-                self.stats.crashes += 1;
+                self.crash(i, restart_at);
                 self.event(&format!(
                     "{} crashed until tick {restart_at}",
                     self.nodes[i].id
@@ -380,26 +404,39 @@ impl Simulation {
         }
     }
 
-    fn restart_due_nodes(&mut self) {
+    /// Restarts nodes whose downtime is over, recovering their state from
+    /// what their disk kept.
+    fn restart_due_nodes(&mut self) -> Result<(), Failure> {
         for i in 0..self.nodes.len() {
             let node = &mut self.nodes[i];
-            match node.state {
-                State::Down { restart_at } if restart_at <= self.now => {}
-                _ => continue,
+            let State::Down { restart_at, disk } = &mut node.state else {
+                continue;
+            };
+            if *restart_at > self.now {
+                continue;
             }
+            let disk = std::mem::take(disk.as_mut());
+            let (storage, recovered) = Storage::open(disk, STORAGE).map_err(|error| {
+                (
+                    ViolationKind::Recovery,
+                    format!("{} failed to recover: {error}", node.id),
+                )
+            })?;
             node.restarts += 1;
             let mut config = node.config.clone();
             config.seed ^= node.restarts;
-            let raft = Raft::restore(config, node.storage.hard_state, node.storage.log())
+            let raft = Raft::restore(config, recovered.hard_state, recovered.log)
                 .expect("valid raft config");
             node.state = State::Up {
                 raft: Box::new(raft),
+                storage: Box::new(storage),
                 paused_until: None,
             };
             node.observed_commit = LogIndex(0);
             let id = node.id;
             self.event(&format!("{id} restarted"));
         }
+        Ok(())
     }
 
     fn heal_everything(&mut self) {
@@ -407,24 +444,22 @@ impl Simulation {
         self.config.faults = crate::config::FaultConfig::none();
         for node in &mut self.nodes {
             match &mut node.state {
-                State::Down { restart_at } => *restart_at = self.now,
+                State::Down { restart_at, .. } => *restart_at = self.now,
                 State::Up { paused_until, .. } => *paused_until = None,
             }
         }
         self.event("all faults healed; settling");
     }
 
+    /// Checks log matching across the running nodes. A crashed node's log
+    /// is checked again once it has restarted.
     fn check_logs(&self) -> Result<(), Failure> {
-        let logs: Vec<Log> = self
+        let logs: Vec<(NodeId, &Log)> = self
             .nodes
             .iter()
-            .map(|n| {
-                n.raft()
-                    .map_or_else(|| n.storage.log(), |r| r.log().clone())
-            })
+            .filter_map(|n| n.raft().map(|r| (n.id, r.log())))
             .collect();
-        let named: Vec<(NodeId, &Log)> = self.nodes.iter().map(|n| n.id).zip(&logs).collect();
-        Checker::check_log_matching(&named)
+        Checker::check_log_matching(&logs)
     }
 
     /// After healing, exactly one leader must exist and every node must have
@@ -495,25 +530,6 @@ fn fnv(mut hash: u64, values: &[u64]) -> u64 {
 mod tests {
     use super::*;
     use crate::config::FaultConfig;
-
-    #[test]
-    fn storage_replaces_a_suffix() {
-        let entry = |index: u64, term: u64| Entry {
-            term: Term(term),
-            index: LogIndex(index),
-            payload: raft_core::EntryPayload::Noop,
-        };
-        let mut storage = Storage::default();
-        storage.persist(&Ready {
-            entries: vec![entry(1, 1), entry(2, 1), entry(3, 1)],
-            ..Ready::default()
-        });
-        storage.persist(&Ready {
-            entries: vec![entry(2, 2)],
-            ..Ready::default()
-        });
-        assert_eq!(storage.entries, vec![entry(1, 1), entry(2, 2)]);
-    }
 
     #[test]
     fn fault_free_run_elects_and_commits() {
