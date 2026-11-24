@@ -198,6 +198,55 @@ On startup, `Storage::open`:
   record with valid data after it, or a missing segment. Skipping damaged
   entries silently could lose acknowledged writes.
 
+## Key-value state machine
+
+The `kv` crate is the state machine Raft replicates. Every node applies the
+same log entries in the same order to its own `KvStore`, so all nodes hold
+the same data and give the same answers.
+
+### Commands in the log
+
+Each log entry holds an encoded `Envelope`: the leader's timestamp and a
+command. The commands are:
+
+| Command | Effect | Response |
+|---|---|---|
+| `RegisterClient` | Opens a session; its id is the entry's log index | `Registered { client_id }` |
+| `Put { key, value }` | Sets the key | `Written` |
+| `Delete { key }` | Removes the key | `Deleted { existed }` |
+| `CompareAndSwap { key, expected, new }` | Sets `key` to `new` if its value equals `expected` (`None` = absent) | `Swapped { succeeded, previous }` |
+| `Get { key }` | Reads through the log (benchmark comparison only) | `Value(..)` |
+
+Normal reads do not go through the log; they use ReadIndex and read the
+local store. Keys are at most 1 KiB and values at most 1 MiB by default;
+larger ones are rejected when applied, identically on every node.
+
+### Sessions and deduplication
+
+A client registers once and then numbers its requests 1, 2, 3, … The store
+keeps, per session, the latest request number and its response:
+
+- a request with the **same** number is a retry: it gets the stored
+  response and changes nothing;
+- a request with a **lower** number is a delayed duplicate: it is rejected
+  as `StaleSequence`, because the client already moved on;
+- a request with a **higher** number is applied and becomes the latest.
+
+Without this, a client that retries after a leader change, not knowing
+whether its first attempt was committed, could apply a write twice. A
+retried compare-and-swap would then report failure for a write that had in
+fact succeeded.
+
+Each client has at most one request in flight, so remembering one response
+per session is enough.
+
+### Expiry
+
+Sessions that have been idle for 5 minutes are removed. Time comes from the
+leader's timestamps in the log, never from a node's own clock, so all nodes
+expire the same sessions at the same log position. See
+[ADR 0004](adr/0004-session-expiry-by-leader-timestamps.md).
+
 ## Snapshots
 
 _Written in milestone 11._
