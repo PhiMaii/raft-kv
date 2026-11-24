@@ -12,7 +12,7 @@ from this repository: deterministic simulation testing, a linearizability
 checker, and a real-process fault-injection harness.
 
 > **Status: work in progress.** The milestones are listed in the
-> [specification](docs/raft-kv-spec.md#4-suggested-milestones-16-weeks).
+> [specification](docs/src/spec.md#4-suggested-milestones-16-weeks).
 > Sections marked _TBD_ below are filled in as each milestone lands.
 
 ## Guarantees
@@ -54,7 +54,7 @@ _TBD (milestone 9)._
 ## Testing
 
 _TBD._ The testing approach is described in the
-[specification](docs/raft-kv-spec.md#3-verification-proving-the-websites-claims).
+[specification](docs/src/spec.md#3-verification-proving-the-websites-claims).
 
 ## Results
 

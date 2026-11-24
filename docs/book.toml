@@ -1,0 +1,10 @@
+[book]
+title = "raft-kv"
+description = "Design, testing methodology and bug log for raft-kv, a linearizable key-value store built on Raft."
+authors = ["PhiMaii"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/PhiMaii/raft-kv"
+edit-url-template = "https://github.com/PhiMaii/raft-kv/edit/main/docs/{path}"
