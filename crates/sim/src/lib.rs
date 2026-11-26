@@ -27,6 +27,7 @@
 
 mod config;
 mod invariants;
+mod kv_history;
 pub mod linearizability;
 mod network;
 mod report;
@@ -34,6 +35,7 @@ mod rng;
 mod simulation;
 
 pub use config::{FaultConfig, SimConfig};
+pub use kv_history::{check_kv_history, KvCheckError, KvModel, KvOp};
 pub use report::{Report, Stats, Violation, ViolationKind};
 pub use rng::Chance;
 

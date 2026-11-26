@@ -13,6 +13,7 @@ name = "raft-kv-sim"
 path = "src/main.rs"
 
 [dependencies]
+kv = { path = "../kv" }
 raft-core = { path = "../raft-core" }
 storage = { path = "../storage" }
 
