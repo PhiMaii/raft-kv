@@ -27,6 +27,7 @@
 
 mod config;
 mod invariants;
+pub mod linearizability;
 mod network;
 mod report;
 mod rng;
