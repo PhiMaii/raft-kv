@@ -141,6 +141,7 @@ impl KvStore {
                 sequence,
                 operation,
             } => self.apply_request(client_id, sequence, operation),
+            Command::Read { key } => self.apply_operation(Operation::Get { key }),
         }
     }
 

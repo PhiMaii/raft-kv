@@ -12,6 +12,7 @@
 //! envelope  = version:u8 (=1) | timestamp_ms:u64 | command
 //! command   = 0 (register)
 //!           | 1 | client_id:u64 | sequence:u64 | operation
+//!           | 2 | key (read)
 //! operation = 0 | key (get)
 //!           | 1 | key | value (put)
 //!           | 2 | key (delete)
@@ -36,8 +37,8 @@ impl fmt::Display for ClientId {
 /// A key-value operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Operation {
-    /// Reads a key through the log. Normal reads use `ReadIndex` instead and
-    /// never reach the log; this exists to compare the two in benchmarks.
+    /// Reads a key through the log as part of a session. Clients normally
+    /// read without a session; see [`Command::Read`].
     Get {
         /// The key to read.
         key: Vec<u8>,
@@ -84,6 +85,15 @@ impl Operation {
 pub enum Command {
     /// Opens a new client session.
     RegisterClient,
+    /// Reads a key through the log, outside any session. A read changes
+    /// nothing, so applying it twice is harmless and it needs no
+    /// deduplication. The leader answers only once the entry is committed
+    /// in its own term, which makes the read linearizable. `ReadIndex`
+    /// gives the same guarantee without writing to the log.
+    Read {
+        /// The key to read.
+        key: Vec<u8>,
+    },
     /// An operation from a client session.
     Request {
         /// The client's session.
@@ -139,6 +149,10 @@ impl Envelope {
                 out.extend_from_slice(&sequence.to_le_bytes());
                 encode_operation(operation, &mut out);
             }
+            Command::Read { key } => {
+                out.push(2);
+                put_bytes(key, &mut out);
+            }
         }
         out
     }
@@ -157,6 +171,9 @@ impl Envelope {
                 client_id: ClientId(reader.u64()?),
                 sequence: reader.u64()?,
                 operation: decode_operation(&mut reader)?,
+            },
+            2 => Command::Read {
+                key: reader.bytes()?,
             },
             tag => return Err(DecodeError(format!("unknown command tag {tag}"))),
         };
@@ -296,7 +313,10 @@ mod tests {
                 new: Vec::new(),
             },
         ];
-        let mut commands = vec![Command::RegisterClient];
+        let mut commands = vec![
+            Command::RegisterClient,
+            Command::Read { key: b"k".to_vec() },
+        ];
         commands.extend(operations.into_iter().map(|operation| Command::Request {
             client_id: ClientId(7),
             sequence: 3,
