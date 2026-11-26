@@ -223,7 +223,7 @@ impl Simulation {
         }
         self.drive_clients(with_workload);
         self.process_readies()?;
-        if self.now % self.config.log_check_interval == 0 {
+        if self.now.is_multiple_of(self.config.log_check_interval) {
             self.check_logs()?;
         }
         Ok(())
