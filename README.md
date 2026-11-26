@@ -50,7 +50,48 @@ seed-driven simulator.
 
 ## Quickstart
 
-_TBD (milestone 9)._
+You need a Rust toolchain ([rustup](https://rustup.rs)); everything else,
+including the Protocol Buffers compiler, comes with the build. Start a
+five-node cluster on ports 7001–7005:
+
+```sh
+scripts/cluster.sh start
+```
+
+Then talk to it. The client finds the leader on its own:
+
+```sh
+target/release/raft-kv put greeting hello
+target/release/raft-kv get greeting                         # hello
+target/release/raft-kv cas greeting hi --expected hello     # swapped
+target/release/raft-kv del greeting
+scripts/cluster.sh status                                   # role, term, log progress per node
+```
+
+Crash the leader and watch the cluster carry on:
+
+```sh
+scripts/cluster.sh kill 3      # SIGKILL node 3, say it is the leader
+scripts/cluster.sh status      # the others elect a new leader
+target/release/raft-kv get greeting
+scripts/cluster.sh start 3     # node 3 recovers from disk and catches up
+scripts/cluster.sh clean       # stop everything and delete the data
+```
+
+Logs are in `data/logs/`, data in `data/node1` … `data/node5`.
+
+### With Docker
+
+```sh
+docker compose up -d --build
+docker compose exec node1 raft-kv put greeting hello
+docker compose exec node1 raft-kv status
+docker compose kill node2 && docker compose start node2
+docker compose down -v
+```
+
+Client commands run inside a container because the nodes know each other
+by their Compose host names.
 
 ## Testing
 
