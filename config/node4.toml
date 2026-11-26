@@ -1,0 +1,20 @@
+# Node 4 of the local five-node cluster. See scripts/cluster.sh.
+id = 4
+listen = "127.0.0.1:7004"
+data_dir = "data/node4"
+
+[[peers]]
+id = 1
+address = "127.0.0.1:7001"
+
+[[peers]]
+id = 2
+address = "127.0.0.1:7002"
+
+[[peers]]
+id = 3
+address = "127.0.0.1:7003"
+
+[[peers]]
+id = 5
+address = "127.0.0.1:7005"

@@ -61,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `client`: client library with leader discovery, `NotLeader` hints,
   retries with the same sequence number, backoff and a deadline.
 - `raft-kv` binary: `server`, `get`, `put`, `del`, `cas` and `status`.
+- A local five-node cluster: `scripts/cluster.sh` (start, stop, kill and
+  restart single nodes, status, logs, clean), `docker-compose.yml` with a
+  `Dockerfile`, and example configurations in `config/`.
 - Cargo workspace with one crate per component (`raft-core`, `storage`,
   `transport`, `kv`, `server`, `client`, `sim`, `chaos`, `bench`, `cli`).
 - Documentation site (mdBook) with the specification, design overview,
