@@ -1,13 +1,17 @@
 //! Runs a whole cluster in one process, driven by a single seed.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 
-use raft_core::{Config, Log, LogIndex, NodeId, ProposeError, Raft, Role, Term};
+use kv::{Command, Envelope, KvConfig, KvStore, Operation, Rejection, Response};
+use raft_core::{Config, EntryPayload, Log, LogIndex, NodeId, ProposeError, Raft, Role, Term};
 use storage::{SimDisk, Storage, StorageOptions};
 
+use crate::client::{Client, InFlight, Pending, Request, Tag};
 use crate::config::SimConfig;
 use crate::invariants::{Checker, Failure};
+use crate::kv_history::{check_kv_history, KvOp};
+use crate::linearizability::{Op, Outcome};
 use crate::network::Network;
 use crate::report::{Report, Stats, Violation, ViolationKind};
 use crate::rng::SimRng;
@@ -19,11 +23,31 @@ const TRACE_LEN: usize = 60;
 /// truncation across segment boundaries.
 const STORAGE: StorageOptions = StorageOptions { segment_size: 2048 };
 
+/// Search steps the linearizability check may take per key. Typical runs
+/// need a few thousand.
+const CHECK_BUDGET: u64 = 20_000_000;
+
+/// The wall-clock time at tick 0, in milliseconds. Leaders stamp commands
+/// with it (plus their clock offset) for session expiry.
+const EPOCH_MS: u64 = 1_700_000_000_000;
+
+/// Milliseconds per tick.
+const TICK_MS: u64 = 10;
+
+/// How long a client waits before trying again when no node accepted its
+/// request, in ticks.
+const RETRY_BACKOFF: u64 = 5;
+
 #[derive(Debug)]
 enum State {
     Up {
         raft: Box<Raft>,
         storage: Box<Storage<SimDisk>>,
+        /// The node's copy of the state machine, rebuilt from the log after
+        /// every restart.
+        kv: Box<KvStore>,
+        /// Client proposals this node accepted as leader, by log index.
+        pending: BTreeMap<LogIndex, Pending>,
         /// The node is paused (receives and does nothing) until this tick.
         paused_until: Option<u64>,
     },
@@ -42,12 +66,23 @@ struct Node {
     /// The commit index last observed, to detect when a leader advances it.
     observed_commit: LogIndex,
     restarts: u64,
+    /// How far this node's wall clock is ahead, in milliseconds. Leaders
+    /// with different clocks stamp commands differently, which the state
+    /// machine's logical clock must tolerate.
+    clock_offset_ms: u64,
 }
 
 impl Node {
     fn raft(&self) -> Option<&Raft> {
         match &self.state {
             State::Up { raft, .. } => Some(raft),
+            State::Down { .. } => None,
+        }
+    }
+
+    fn kv(&self) -> Option<&KvStore> {
+        match &self.state {
+            State::Up { kv, .. } => Some(kv),
             State::Down { .. } => None,
         }
     }
@@ -69,7 +104,12 @@ pub(crate) struct Simulation {
     stats: Stats,
     trace: VecDeque<String>,
     fingerprint: u64,
-    next_command: u64,
+    clients: Vec<Client>,
+    /// Every client operation, for the linearizability check.
+    history: Vec<KvOp>,
+    /// Logical time for the history: increases with every invocation and
+    /// completion, so that their order is exact even within one tick.
+    history_clock: u64,
 }
 
 impl Simulation {
@@ -96,16 +136,18 @@ impl Simulation {
                     state: State::Up {
                         raft: Box::new(raft),
                         storage: Box::new(storage),
+                        kv: Box::new(KvStore::new(KvConfig::default())),
+                        pending: BTreeMap::new(),
                         paused_until: None,
                     },
                     observed_commit: LogIndex(0),
                     restarts: 0,
+                    clock_offset_ms: rng.below(2_000),
                 }
             })
             .collect();
         Self {
             seed,
-            config,
             now: 0,
             rng,
             nodes,
@@ -114,7 +156,10 @@ impl Simulation {
             stats: Stats::default(),
             trace: VecDeque::new(),
             fingerprint: 0xCBF2_9CE4_8422_2325,
-            next_command: 0,
+            clients: (0..config.clients).map(Client::new).collect(),
+            history: Vec::new(),
+            history_clock: 0,
+            config,
         }
     }
 
@@ -126,6 +171,12 @@ impl Simulation {
             Ok(Ok(())) => {
                 self.stats.leaders_elected = self.checker.leaders_elected();
                 self.stats.committed_index = self.checker.committed_index().0;
+                for op in &self.history {
+                    match op.outcome {
+                        Outcome::Returned { .. } => self.stats.operations_completed += 1,
+                        Outcome::Unknown => self.stats.operations_unknown += 1,
+                    }
+                }
                 Ok(Report {
                     seed: self.seed,
                     stats: self.stats,
@@ -154,7 +205,8 @@ impl Simulation {
             self.tick(false)?;
         }
         self.check_logs()?;
-        self.check_converged()
+        self.check_converged()?;
+        self.check_history()
     }
 
     /// One unit of simulated time.
@@ -169,9 +221,7 @@ impl Simulation {
                 }
             }
         }
-        if with_workload && self.rng.chance(self.config.propose) {
-            self.propose();
-        }
+        self.drive_clients(with_workload);
         self.process_readies()?;
         if self.now % self.config.log_check_interval == 0 {
             self.check_logs()?;
@@ -204,20 +254,112 @@ impl Simulation {
         }
     }
 
-    /// A client sends a command to a random node. If that node is not the
-    /// leader but knows who is, the client retries there once.
-    fn propose(&mut self) {
-        let first = self.nodes[self.rng.index(self.nodes.len())].id;
-        if let Err(ProposeError::NotLeader {
-            leader_hint: Some(leader),
-        }) = self.propose_to(first)
-        {
-            // Like the client library: follow the hint once.
-            let _ = self.propose_to(leader);
+    /// Lets every client make progress: open a session if it has none,
+    /// start a new operation if it is idle (only while `start_new`), and send
+    /// its request again if the last attempt went unanswered for too long.
+    fn drive_clients(&mut self, start_new: bool) {
+        for c in 0..self.clients.len() {
+            let client = &mut self.clients[c];
+            let due = match &client.in_flight {
+                Some(in_flight) if self.now >= in_flight.deadline => {
+                    // Give up. The history keeps the operation as unknown;
+                    // the next operation uses a higher sequence number.
+                    client.in_flight = None;
+                    false
+                }
+                Some(in_flight) => self.now >= in_flight.retry_at,
+                None if client.session.is_none() => {
+                    client.in_flight = Some(InFlight {
+                        request: Request::Register,
+                        retry_at: 0,
+                        deadline: self.now + self.config.client_deadline,
+                    });
+                    true
+                }
+                None if start_new && self.rng.chance(self.config.request) => {
+                    let (sequence, operation) =
+                        client.next_operation(&mut self.rng, self.config.keys);
+                    self.history_clock += 1;
+                    self.history.push(Op {
+                        client: c as u64,
+                        call: self.history_clock,
+                        input: operation.clone(),
+                        outcome: Outcome::Unknown,
+                    });
+                    client.in_flight = Some(InFlight {
+                        request: Request::Operation {
+                            sequence,
+                            operation,
+                            history_index: self.history.len() - 1,
+                        },
+                        retry_at: 0,
+                        deadline: self.now + self.config.client_deadline,
+                    });
+                    true
+                }
+                None => false,
+            };
+            if due {
+                self.send_request(c);
+            }
         }
     }
 
-    fn propose_to(&mut self, id: NodeId) -> Result<(), ProposeError> {
+    /// Sends client `c`'s request to the node it believes is leader, or to a
+    /// random node. A node that is not leader but knows who is points the
+    /// client there, and the client follows the hint once right away.
+    fn send_request(&mut self, c: usize) {
+        let client = &self.clients[c];
+        let Some(in_flight) = &client.in_flight else {
+            return;
+        };
+        let command = match &in_flight.request {
+            Request::Register => Command::RegisterClient,
+            Request::Operation {
+                sequence,
+                operation,
+                ..
+            } => Command::Request {
+                client_id: client.session.expect("operations need a session"),
+                sequence: *sequence,
+                operation: operation.clone(),
+            },
+        };
+        let tag = in_flight.request.tag();
+        let target = match client.leader_guess {
+            Some(id) => id,
+            None => self.nodes[self.rng.index(self.nodes.len())].id,
+        };
+        let mut result = self.propose_to(target, &command, c, tag).map(|()| target);
+        if let Err(ProposeError::NotLeader {
+            leader_hint: Some(leader),
+        }) = result
+        {
+            if leader != target {
+                result = self.propose_to(leader, &command, c, tag).map(|()| leader);
+            }
+        }
+        let client = &mut self.clients[c];
+        client.leader_guess = result.ok();
+        // Wait for an answer if a leader took the request; otherwise try
+        // again shortly, once an election may have produced a leader.
+        let wait = if result.is_ok() {
+            self.config.client_timeout
+        } else {
+            RETRY_BACKOFF
+        };
+        if let Some(in_flight) = &mut client.in_flight {
+            in_flight.retry_at = self.now + wait;
+        }
+    }
+
+    fn propose_to(
+        &mut self,
+        id: NodeId,
+        command: &Command,
+        client: usize,
+        tag: Tag,
+    ) -> Result<(), ProposeError> {
         let now = self.now;
         let not_reachable = ProposeError::NotLeader { leader_hint: None };
         let Some(node) = self.nodes.iter_mut().find(|n| n.id == id) else {
@@ -226,12 +368,90 @@ impl Simulation {
         if !node.is_active(now) {
             return Err(not_reachable);
         }
-        let State::Up { raft, .. } = &mut node.state else {
+        let clock_ms = EPOCH_MS + now * TICK_MS + node.clock_offset_ms;
+        let State::Up { raft, pending, .. } = &mut node.state else {
             return Err(not_reachable);
         };
-        raft.propose(self.next_command.to_le_bytes().to_vec())?;
-        self.next_command += 1;
+        let envelope = Envelope {
+            timestamp_ms: clock_ms,
+            command: command.clone(),
+        };
+        let index = raft.propose(envelope.encode())?;
+        pending.insert(
+            index,
+            Pending {
+                term: raft.term(),
+                client,
+                tag,
+            },
+        );
         self.stats.proposals_accepted += 1;
+        Ok(())
+    }
+
+    /// The node gave up on a proposal; its client sends the request again
+    /// on the next tick.
+    fn retry_soon(&mut self, pending: Pending) {
+        let client = &mut self.clients[pending.client];
+        if let Some(in_flight) = &mut client.in_flight {
+            if in_flight.request.tag() == pending.tag {
+                in_flight.retry_at = self.now + 1;
+                client.leader_guess = None;
+            }
+        }
+    }
+
+    /// Hands a node's response to the client that sent the request, unless
+    /// the response is lost on the way or answers a request the client has
+    /// already moved past.
+    fn deliver(&mut self, pending: Pending, response: Response) -> Result<(), Failure> {
+        if self.rng.chance(self.config.faults.drop) {
+            self.stats.responses_lost += 1;
+            return Ok(());
+        }
+        let client = &mut self.clients[pending.client];
+        let answers_current = client
+            .in_flight
+            .as_ref()
+            .is_some_and(|in_flight| in_flight.request.tag() == pending.tag);
+        if !answers_current {
+            return Ok(());
+        }
+        let in_flight = client.in_flight.take().expect("checked above");
+        match (in_flight.request, response) {
+            (Request::Register, Response::Registered { client_id }) => {
+                client.registered(client_id);
+            }
+            (Request::Operation { .. }, Response::Rejected(Rejection::SessionExpired)) => {
+                // The outcome stays unknown; start over with a new session.
+                client.session = None;
+            }
+            (
+                Request::Operation {
+                    operation,
+                    history_index,
+                    ..
+                },
+                response,
+            ) if !matches!(
+                response,
+                Response::Rejected(_) | Response::Registered { .. }
+            ) =>
+            {
+                client.observe(&operation, &response);
+                self.history_clock += 1;
+                self.history[history_index].outcome = Outcome::Returned {
+                    at: self.history_clock,
+                    output: response,
+                };
+            }
+            (request, response) => {
+                return Err((
+                    ViolationKind::Linearizability,
+                    format!("client {} got {response:?} for {request:?}", pending.client),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -239,9 +459,18 @@ impl Simulation {
     /// invariants against what changed. A node may crash in the middle of
     /// persisting; it then sends and applies nothing.
     fn process_readies(&mut self) -> Result<(), Failure> {
+        let mut responses = Vec::new();
+        let mut dropped = Vec::new();
         for i in 0..self.nodes.len() {
             let node = &mut self.nodes[i];
-            let State::Up { raft, storage, .. } = &mut node.state else {
+            let State::Up {
+                raft,
+                storage,
+                kv,
+                pending,
+                ..
+            } = &mut node.state
+            else {
                 continue;
             };
             let ready = raft.take_ready();
@@ -278,6 +507,27 @@ impl Simulation {
 
             for entry in &ready.committed_entries {
                 self.checker.on_apply(id, entry)?;
+                let proposal = pending.remove(&entry.index);
+                if let EntryPayload::Command(bytes) = &entry.payload {
+                    let response = kv.apply(entry.index.0, bytes);
+                    // Answer only if this is the entry the node proposed; a
+                    // different term means it was replaced after a leader
+                    // change, and the client will retry.
+                    match proposal {
+                        Some(p) if p.term == entry.term => responses.push((p, response)),
+                        Some(p) => dropped.push(p),
+                        None => {}
+                    }
+                } else if let Some(p) = proposal {
+                    dropped.push(p);
+                }
+            }
+            // A node that lost leadership tells its waiting clients, which
+            // then retry elsewhere. Their proposals may still commit under
+            // the next leader; the session table keeps a retry from being
+            // applied twice.
+            if role != Role::Leader {
+                dropped.extend(std::mem::take(pending).into_values());
             }
             for message in ready.messages {
                 self.network.send(
@@ -291,6 +541,12 @@ impl Simulation {
             if role == Role::Leader && !self.trace_mentions_leader(id, term) {
                 self.event(&format!("{id} is leader in {term}"));
             }
+        }
+        for (pending, response) in responses {
+            self.deliver(pending, response)?;
+        }
+        for pending in dropped {
+            self.retry_soon(pending);
         }
         Ok(())
     }
@@ -430,6 +686,8 @@ impl Simulation {
             node.state = State::Up {
                 raft: Box::new(raft),
                 storage: Box::new(storage),
+                kv: Box::new(KvStore::new(KvConfig::default())),
+                pending: BTreeMap::new(),
                 paused_until: None,
             };
             node.observed_commit = LogIndex(0);
@@ -488,7 +746,57 @@ impl Simulation {
                 ));
             }
         }
+        let leader_kv = self
+            .nodes
+            .iter()
+            .find(|n| n.id == leader.id())
+            .and_then(Node::kv);
+        for node in &self.nodes {
+            if node.kv() != leader_kv {
+                return Err((
+                    ViolationKind::StateMachineSafety,
+                    format!(
+                        "{} applied the same log as {} but its key-value state differs",
+                        node.id,
+                        leader.id()
+                    ),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Reads every key once more after the cluster has converged, so that a
+    /// lost write shows up as a stale read, then checks the whole history
+    /// for linearizability.
+    fn check_history(&mut self) -> Result<(), Failure> {
+        let kv = self
+            .nodes
+            .iter()
+            .find(|n| n.raft().is_some_and(|r| r.role() == Role::Leader))
+            .and_then(Node::kv)
+            .expect("a converged cluster has a leader");
+        let final_reads: Vec<(Vec<u8>, Option<Vec<u8>>)> = (0..self.config.keys)
+            .map(|k| {
+                let key = format!("k{k}").into_bytes();
+                let value = kv.get(&key).map(<[u8]>::to_vec);
+                (key, value)
+            })
+            .collect();
+        for (key, value) in final_reads {
+            self.history.push(Op {
+                client: u64::MAX,
+                call: self.history_clock + 1,
+                input: Operation::Get { key },
+                outcome: Outcome::Returned {
+                    at: self.history_clock + 2,
+                    output: Response::Value(value),
+                },
+            });
+            self.history_clock += 2;
+        }
+        check_kv_history(&self.history, CHECK_BUDGET)
+            .map_err(|error| (ViolationKind::Linearizability, error.to_string()))
     }
 
     fn trace_mentions_leader(&self, id: NodeId, term: Term) -> bool {
@@ -541,6 +849,8 @@ mod tests {
         let report = Simulation::new(1, config).run().expect("no violation");
         assert_eq!(report.stats.leaders_elected, 1);
         assert!(report.stats.committed_index > 50, "{report:?}");
+        assert!(report.stats.operations_completed > 50, "{report:?}");
+        assert_eq!(report.stats.operations_unknown, 0);
         assert_eq!(report.stats.messages_dropped, 0);
     }
 }

@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   log reads; client sessions that deduplicate retries; deterministic
   session expiry by leader timestamps (ADR 0004); key and value size limits;
   and a versioned binary encoding for commands in the log.
+- `sim`: a linearizability checker (Wing and Gong's algorithm with Lowe's
+  memoization) that checks key-value histories one key at a time and
+  handles operations with unknown outcomes.
+- `sim`: simulated clients with sessions, retries, leader hints and
+  deadlines run a key-value workload in every run. The simulator applies
+  committed entries to each node's `KvStore`, checks that all replicas end
+  up identical, and checks the recorded history for linearizability.
 - Cargo workspace with one crate per component (`raft-core`, `storage`,
   `transport`, `kv`, `server`, `client`, `sim`, `chaos`, `bench`, `cli`).
 - Documentation site (mdBook) with the specification, design overview,

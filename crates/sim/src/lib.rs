@@ -14,8 +14,12 @@
 //! - **State machine safety:** no two nodes apply different entries at the
 //!   same index.
 //!
-//! At the end of a run all faults are healed, and the cluster must converge:
-//! one leader, identical logs, everything applied.
+//! Simulated clients run a key-value workload throughout, with sessions,
+//! retries, leader hints and deadlines, and record every operation's
+//! invocation and result. At the end of a run all faults are healed, and the
+//! cluster must converge: one leader, identical logs and key-value state,
+//! everything applied. Then the recorded history must be **linearizable**;
+//! see [`linearizability`] for the checker.
 //!
 //! The same seed always produces the same run, so any failure reproduces
 //! exactly:
@@ -25,14 +29,18 @@
 //! assert_eq!(report, sim::run(42, &sim::SimConfig::default()).unwrap());
 //! ```
 
+mod client;
 mod config;
 mod invariants;
+mod kv_history;
+pub mod linearizability;
 mod network;
 mod report;
 mod rng;
 mod simulation;
 
 pub use config::{FaultConfig, SimConfig};
+pub use kv_history::{check_kv_history, KvCheckError, KvModel, KvOp};
 pub use report::{Report, Stats, Violation, ViolationKind};
 pub use rng::Chance;
 

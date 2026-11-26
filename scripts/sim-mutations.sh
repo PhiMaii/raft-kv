@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Checks that the simulator catches known Raft bugs.
+# Checks that the simulator catches known bugs.
 #
-# Each mutation injects one known bug into raft-core or the storage layer,
-# runs the simulator over a range of seeds, and reports how many seeds
-# detected it. Source files are restored afterwards, also on failure or
-# Ctrl-C.
+# Each mutation injects one known bug into raft-core, the storage layer or
+# the key-value state machine, runs the simulator over a range of seeds, and
+# reports how many seeds detected it. Source files are restored afterwards,
+# also on failure or Ctrl-C.
 #
 # Usage: scripts/sim-mutations.sh [seeds]   (default: 1000)
 
@@ -13,7 +13,8 @@ set -euo pipefail
 SEEDS="${1:-1000}"
 RAFT="crates/raft-core/src/raft.rs"
 WAL="crates/storage/src/wal.rs"
-FILES=("$RAFT" "$WAL")
+KV="crates/kv/src/store.rs"
+FILES=("$RAFT" "$WAL" "$KV")
 cd "$(git rev-parse --show-toplevel)"
 
 if ! git diff --quiet -- "${FILES[@]}"; then
@@ -72,3 +73,5 @@ mutate "$WAL" "shorten a segment before removing later ones" \
         if !removed.is_empty() {
             disk.sync_dir()?;
         }'
+mutate "$KV" "apply a retried request again" \
+  'if sequence == session.sequence {' 'if false && sequence == session.sequence {'

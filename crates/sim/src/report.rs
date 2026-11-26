@@ -24,8 +24,14 @@ pub struct Stats {
     pub pauses: u64,
     /// Distinct `(term, leader)` pairs observed.
     pub leaders_elected: u64,
-    /// Proposals accepted by a leader.
+    /// Proposals accepted by a leader, including client retries.
     pub proposals_accepted: u64,
+    /// Client operations that completed with a result.
+    pub operations_completed: u64,
+    /// Client operations whose result the client never learned.
+    pub operations_unknown: u64,
+    /// Responses lost on the way back to the client.
+    pub responses_lost: u64,
     /// Highest log index committed by any leader.
     pub committed_index: u64,
 }
@@ -60,6 +66,9 @@ pub enum ViolationKind {
     Liveness,
     /// A node could not recover its state from disk after a crash.
     Recovery,
+    /// The history of client operations is not linearizable, or a client
+    /// received a response it should never get.
+    Linearizability,
     /// A node panicked, for example on an internal assertion.
     Panic,
 }
@@ -73,6 +82,7 @@ impl fmt::Display for ViolationKind {
             Self::StateMachineSafety => "state machine safety",
             Self::Liveness => "liveness",
             Self::Recovery => "recovery",
+            Self::Linearizability => "linearizability",
             Self::Panic => "panic",
         };
         f.write_str(name)

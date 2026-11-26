@@ -66,6 +66,19 @@ pub enum Operation {
     },
 }
 
+impl Operation {
+    /// The key the operation reads or writes.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Self::Get { key }
+            | Self::Put { key, .. }
+            | Self::Delete { key }
+            | Self::CompareAndSwap { key, .. } => key,
+        }
+    }
+}
+
 /// A command for the state machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
