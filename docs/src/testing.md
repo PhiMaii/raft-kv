@@ -91,6 +91,19 @@ raft-kv is tested at four levels:
   The simulator does not cover this crate; the real-process harness
   (milestone 14) will.
 
+- **Cluster tests with the client library** (`crates/client/tests/cluster.rs`):
+  three nodes in one process, each in a Tokio runtime of its own so it can
+  be killed together with its connections. A client that only knows a
+  follower finds the leader and runs every operation; acknowledged writes
+  survive the leader being killed; the old leader restarts from its data
+  directory and catches up as a follower; a node without its data
+  directory refuses to start.
+- **Process tests** (`crates/cli/tests/cluster.rs`): five real
+  `raft-kv server` processes, driven through the `raft-kv` command line.
+  They elect a leader and serve every operation; the leader is killed with
+  `SIGKILL`, the other four elect a new one and keep every acknowledged
+  write; the old leader restarts from disk and catches up.
+
 ## Deterministic simulation
 
 The `sim` crate runs a whole cluster in one process. Network, clock and

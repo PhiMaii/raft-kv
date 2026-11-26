@@ -8,5 +8,20 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+kv = { path = "../kv" }
+raft-core = { path = "../raft-core" }
+serde = { version = "1", features = ["derive"] }
+storage = { path = "../storage" }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+toml = "1"
+tonic = "0.14"
+tracing = "0.1"
+transport = { path = "../transport" }
+
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

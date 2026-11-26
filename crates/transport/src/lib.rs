@@ -36,9 +36,12 @@ pub mod proto {
 }
 
 pub use api::{
-    ApiError, ClientError, KvClient, KvHandler, KvService, LeaderHint, Swapped, WriteId,
+    ApiError, ClientError, KvClient, KvHandler, KvService, LeaderHint, Member, NodeStatus, Swapped,
+    WriteId,
 };
 pub use peer::{InvalidAddress, Peer, PeerConfig, RaftService};
+/// gRPC status codes, as found in [`ClientError::Rpc`].
+pub use tonic::{Code, Status};
 
 /// The largest gRPC message accepted, in bytes. Large enough for a batch of
 /// log entries carrying maximum-size values.

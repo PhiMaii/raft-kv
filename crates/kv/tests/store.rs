@@ -105,6 +105,20 @@ fn put_get_and_delete() {
 }
 
 #[test]
+fn reads_need_no_session_and_change_nothing() {
+    let mut log = Log::new();
+    let read = |key: &str| Command::Read { key: key.into() };
+    assert_eq!(log.apply(read("a")), Response::Value(None));
+    let c = log.register();
+    log.request(c, 1, put("a", "1"));
+    assert_eq!(log.apply(read("a")), Response::Value(Some(b"1".to_vec())));
+    // Applying the same read again is harmless.
+    assert_eq!(log.apply(read("a")), Response::Value(Some(b"1".to_vec())));
+    assert_eq!(log.store.session_count(), 1);
+    assert_eq!(log.store.len(), 1);
+}
+
+#[test]
 fn compare_and_swap_succeeds_only_on_a_match() {
     let mut log = Log::new();
     let c = log.register();
@@ -256,6 +270,12 @@ fn oversized_keys_and_values_are_rejected() {
     assert_eq!(
         log.request(c, 3, cas("k", Some("much too long"), "v")),
         Response::Rejected(Rejection::ValueTooLarge)
+    );
+    assert_eq!(
+        log.apply(Command::Read {
+            key: b"toolong".to_vec()
+        }),
+        Response::Rejected(Rejection::KeyTooLarge)
     );
     assert!(log.store.is_empty());
 }

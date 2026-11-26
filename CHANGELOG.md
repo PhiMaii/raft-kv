@@ -51,6 +51,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`RegisterClient`, `Get`, `Put`, `Delete`, `CompareAndSwap`) returns
   typed errors, including `NotLeader` with a leader hint; `KvService`
   delegates to a `KvHandler`, and `KvClient` is a typed client.
+- `kv`: a `Read` command that reads through the log without a session.
+- `transport`: a `Status` call that reports a node's role, term, leader and
+  log progress.
+- `server`: runs a node from a TOML configuration. One task drives Raft,
+  persists each round with one fsync before sending, applies committed
+  entries and answers waiting clients. Refuses to start without its data
+  directory unless `--init` is given. Logs role changes with `tracing`.
+- `client`: client library with leader discovery, `NotLeader` hints,
+  retries with the same sequence number, backoff and a deadline.
+- `raft-kv` binary: `server`, `get`, `put`, `del`, `cas` and `status`.
 - Cargo workspace with one crate per component (`raft-core`, `storage`,
   `transport`, `kv`, `server`, `client`, `sim`, `chaos`, `bench`, `cli`).
 - Documentation site (mdBook) with the specification, design overview,
