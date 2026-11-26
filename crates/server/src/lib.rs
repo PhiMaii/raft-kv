@@ -36,7 +36,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tracing::{info, Instrument};
 use transport::{KvService, Peer, PeerConfig, RaftService};
 
-pub use config::{ConfigError, PeerAddress, ServerConfig};
+pub use config::{ConfigError, PeerAddress, ReadMode, ServerConfig};
 
 use crate::handler::Handler;
 use crate::node::Node;
@@ -167,7 +167,7 @@ pub async fn start(config: ServerConfig, data_dir: DataDir) -> Result<Server, St
 
     let (inbox, inbox_receiver) = mpsc::channel(INBOX);
     let (requests, request_receiver) = mpsc::channel(REQUESTS);
-    let handler = Handler::new(requests, config.request_timeout());
+    let handler = Handler::new(requests, config.request_timeout(), config.read_mode);
     let grpc = tonic::transport::Server::builder()
         .add_service(RaftService::new(id, inbox).into_server())
         .add_service(KvService::new(Arc::new(handler)).into_server())

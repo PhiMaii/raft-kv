@@ -35,22 +35,26 @@ pub(crate) fn encode_message(message: &Message) -> wire::RaftMessage {
             prev_log_term,
             entries,
             leader_commit,
+            read_round,
         } => wire::raft_message::Body::AppendEntries(wire::AppendEntries {
             prev_log_index: prev_log_index.0,
             prev_log_term: prev_log_term.0,
             entries: entries.iter().map(encode_entry).collect(),
             leader_commit: leader_commit.0,
+            read_round: *read_round,
         }),
         MessageBody::AppendEntriesResponse {
             success,
             match_index,
             conflict_index,
             conflict_term,
+            read_round,
         } => wire::raft_message::Body::AppendEntriesResponse(wire::AppendEntriesResponse {
             success: *success,
             match_index: match_index.0,
             conflict_index: conflict_index.0,
             conflict_term: conflict_term.map(|term| term.0),
+            read_round: *read_round,
         }),
     };
     wire::RaftMessage {
@@ -81,6 +85,7 @@ pub(crate) fn decode_message(message: wire::RaftMessage) -> Result<Message, Inva
                 .map(decode_entry)
                 .collect::<Result<_, _>>()?,
             leader_commit: LogIndex(append.leader_commit),
+            read_round: append.read_round,
         },
         wire::raft_message::Body::AppendEntriesResponse(response) => {
             MessageBody::AppendEntriesResponse {
@@ -88,6 +93,7 @@ pub(crate) fn decode_message(message: wire::RaftMessage) -> Result<Message, Inva
                 match_index: LogIndex(response.match_index),
                 conflict_index: LogIndex(response.conflict_index),
                 conflict_term: response.conflict_term.map(Term),
+                read_round: response.read_round,
             }
         }
     };
@@ -152,6 +158,7 @@ mod tests {
                 prev_log_term: Term(5),
                 entries: Vec::new(),
                 leader_commit: LogIndex(8),
+                read_round: 12,
             },
             MessageBody::AppendEntries {
                 prev_log_index: LogIndex(0),
@@ -174,18 +181,21 @@ mod tests {
                     },
                 ],
                 leader_commit: LogIndex(1),
+                read_round: 0,
             },
             MessageBody::AppendEntriesResponse {
                 success: true,
                 match_index: LogIndex(3),
                 conflict_index: LogIndex(0),
                 conflict_term: None,
+                read_round: 12,
             },
             MessageBody::AppendEntriesResponse {
                 success: false,
                 match_index: LogIndex(0),
                 conflict_index: LogIndex(4),
                 conflict_term: Some(Term(0)),
+                read_round: 3,
             },
         ];
         for body in bodies {
@@ -216,6 +226,7 @@ mod tests {
                 payload: EntryPayload::Noop,
             }],
             leader_commit: LogIndex(0),
+            read_round: 0,
         }));
         if let Some(wire::raft_message::Body::AppendEntries(append)) = &mut no_payload.body {
             append.entries[0].payload = None;

@@ -28,6 +28,12 @@ pub struct SimConfig {
     pub keys: u64,
     /// Chance per tick that an idle client starts a new operation.
     pub request: Chance,
+    /// Chance that a client forgets which node is leader before starting an
+    /// operation, and sends it to a random node.
+    pub forget_leader: Chance,
+    /// Chance that a read goes through the log within the client's session
+    /// instead of using ReadIndex, so that both paths are checked.
+    pub log_reads: Chance,
     /// How long a client waits for an answer before sending the request
     /// again, in ticks.
     pub client_timeout: u64,
@@ -60,6 +66,15 @@ pub struct FaultConfig {
     pub partition: Chance,
     /// Chance per tick that all partitions heal.
     pub heal: Chance,
+    /// Chance per tick that the current leader is cut off from every other
+    /// node for a long time (`isolation_length`), unaffected by `heal`. The
+    /// rest of the cluster elects a new leader and carries on, while the old
+    /// one still believes it leads. Random partitions heal too quickly to
+    /// produce this; it is what a leader that serves reads without
+    /// confirming its leadership gets wrong.
+    pub leader_isolation: Chance,
+    /// How long a leader isolation lasts, in ticks: `(min, max)`.
+    pub isolation_length: (u64, u64),
     /// Chance per tick, per running node, that the node crashes.
     pub crash: Chance,
     /// Chance per tick that the current leader crashes. Crashing leaders
@@ -92,6 +107,8 @@ impl FaultConfig {
             spike_delay: (1, 1),
             partition: Chance::NEVER,
             heal: Chance::NEVER,
+            leader_isolation: Chance::NEVER,
+            isolation_length: (1, 1),
             crash: Chance::NEVER,
             leader_crash: Chance::NEVER,
             write_crash: Chance::NEVER,
@@ -115,6 +132,8 @@ impl Default for FaultConfig {
             spike_delay: (10, 80),
             partition: Chance::percent(1),
             heal: Chance::percent(4),
+            leader_isolation: Chance::per_million(2_000),
+            isolation_length: (100, 300),
             crash: Chance::per_million(1_000),
             leader_crash: Chance::percent(2),
             write_crash: Chance::per_million(2_000),
@@ -136,6 +155,8 @@ impl Default for SimConfig {
             clients: 5,
             keys: 3,
             request: Chance::percent(30),
+            forget_leader: Chance::percent(10),
+            log_reads: Chance::percent(25),
             client_timeout: 40,
             client_deadline: 400,
             faults: FaultConfig::default(),

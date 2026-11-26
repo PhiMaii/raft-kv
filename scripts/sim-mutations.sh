@@ -73,5 +73,13 @@ mutate "$WAL" "shorten a segment before removing later ones" \
         if !removed.is_empty() {
             disk.sync_dir()?;
         }'
+mutate "$RAFT" "serve reads without confirming leadership" \
+  'let (Some(index), true) = (read.index, read.round <= self.confirmed_round) else {' \
+  'let (Some(index), true) = (read.index, true) else {'
+mutate "$RAFT" "serve reads before committing in the term" \
+  'if self.log.term_at(self.commit_index) == Some(self.current_term) {
+            for read in &mut self.pending_reads {' \
+  'if true {
+            for read in &mut self.pending_reads {'
 mutate "$KV" "apply a retried request again" \
   'if sequence == session.sequence {' 'if false && sequence == session.sequence {'

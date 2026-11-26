@@ -6,7 +6,8 @@
 //! the same responses.
 //!
 //! Supported operations are put, delete, compare-and-swap and reads through
-//! the log (until `ReadIndex` lands, and afterwards to compare against it).
+//! the log. Clients normally read with `ReadIndex` instead, which bypasses
+//! the log; log reads remain for comparison in benchmarks.
 //! Client sessions deduplicate retried requests, so a write is never applied
 //! twice.
 

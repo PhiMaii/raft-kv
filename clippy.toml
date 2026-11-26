@@ -1,1 +1,3 @@
 msrv = "1.88"
+# Raft terms used as words in prose, plus clippy's defaults ("..").
+doc-valid-idents = ["ReadIndex", "PreVote", ".."]

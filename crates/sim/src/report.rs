@@ -14,6 +14,8 @@ pub struct Stats {
     pub messages_duplicated: u64,
     /// Partitions started.
     pub partitions: u64,
+    /// Times the leader was isolated for a long time.
+    pub leader_isolations: u64,
     /// Node crashes, including crashes while writing.
     pub crashes: u64,
     /// Crashes in the middle of persisting a `Ready`.
@@ -26,6 +28,8 @@ pub struct Stats {
     pub leaders_elected: u64,
     /// Proposals accepted by a leader, including client retries.
     pub proposals_accepted: u64,
+    /// Reads a leader confirmed with ReadIndex.
+    pub reads_confirmed: u64,
     /// Client operations that completed with a result.
     pub operations_completed: u64,
     /// Client operations whose result the client never learned.

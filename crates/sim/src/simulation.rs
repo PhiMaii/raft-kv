@@ -4,10 +4,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 
 use kv::{Command, Envelope, KvConfig, KvStore, Operation, Rejection, Response};
-use raft_core::{Config, EntryPayload, Log, LogIndex, NodeId, ProposeError, Raft, Role, Term};
+use raft_core::{
+    Config, EntryPayload, Log, LogIndex, NodeId, ProposeError, Raft, ReadIndexError, ReadState,
+    Role, Term,
+};
 use storage::{SimDisk, Storage, StorageOptions};
 
-use crate::client::{Client, InFlight, Pending, Request, Tag};
+use crate::client::{Client, InFlight, Pending, PendingRead, Request, Tag};
 use crate::config::SimConfig;
 use crate::invariants::{Checker, Failure};
 use crate::kv_history::{check_kv_history, KvOp};
@@ -48,6 +51,11 @@ enum State {
         kv: Box<KvStore>,
         /// Client proposals this node accepted as leader, by log index.
         pending: BTreeMap<LogIndex, Pending>,
+        /// ReadIndex reads this node accepted as leader, by read id.
+        reads: BTreeMap<u64, PendingRead>,
+        /// Confirmed reads waiting for the state machine to reach their
+        /// index.
+        confirmed_reads: Vec<(LogIndex, PendingRead)>,
         /// The node is paused (receives and does nothing) until this tick.
         paused_until: Option<u64>,
     },
@@ -56,6 +64,15 @@ enum State {
         /// The disk as it survived the crash.
         disk: Box<SimDisk>,
     },
+}
+
+/// How a client request reaches a node.
+#[derive(Debug)]
+enum Submission {
+    /// As a proposal, through the log.
+    Propose(Command),
+    /// As a ReadIndex read of a key.
+    Read(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -110,6 +127,10 @@ pub(crate) struct Simulation {
     /// Logical time for the history: increases with every invocation and
     /// completion, so that their order is exact even within one tick.
     history_clock: u64,
+    /// The id of the last ReadIndex read, unique across the run.
+    last_read_id: u64,
+    /// A node cut off from all others, and until which tick.
+    isolated: Option<(NodeId, u64)>,
 }
 
 impl Simulation {
@@ -138,6 +159,8 @@ impl Simulation {
                         storage: Box::new(storage),
                         kv: Box::new(KvStore::new(KvConfig::default())),
                         pending: BTreeMap::new(),
+                        reads: BTreeMap::new(),
+                        confirmed_reads: Vec::new(),
                         paused_until: None,
                     },
                     observed_commit: LogIndex(0),
@@ -159,6 +182,8 @@ impl Simulation {
             clients: (0..config.clients).map(Client::new).collect(),
             history: Vec::new(),
             history_clock: 0,
+            last_read_id: 0,
+            isolated: None,
             config,
         }
     }
@@ -267,7 +292,15 @@ impl Simulation {
                     client.in_flight = None;
                     false
                 }
-                Some(in_flight) => self.now >= in_flight.retry_at,
+                Some(in_flight) => {
+                    let due = self.now >= in_flight.retry_at;
+                    if due {
+                        // No answer in time: like the client library, try
+                        // another node instead of insisting on this one.
+                        client.leader_guess = None;
+                    }
+                    due
+                }
                 None if client.session.is_none() => {
                     client.in_flight = Some(InFlight {
                         request: Request::Register,
@@ -277,8 +310,16 @@ impl Simulation {
                     true
                 }
                 None if start_new && self.rng.chance(self.config.request) => {
+                    if self.rng.chance(self.config.forget_leader) {
+                        // As if a new client process connected: it knows no
+                        // leader and starts at an arbitrary node, possibly a
+                        // deposed leader that does not know it yet.
+                        client.leader_guess = None;
+                    }
                     let (sequence, operation) =
                         client.next_operation(&mut self.rng, self.config.keys);
+                    let read_index = matches!(operation, Operation::Get { .. })
+                        && !self.rng.chance(self.config.log_reads);
                     self.history_clock += 1;
                     self.history.push(Op {
                         client: c as u64,
@@ -291,6 +332,7 @@ impl Simulation {
                             sequence,
                             operation,
                             history_index: self.history.len() - 1,
+                            read_index,
                         },
                         retry_at: 0,
                         deadline: self.now + self.config.client_deadline,
@@ -313,30 +355,32 @@ impl Simulation {
         let Some(in_flight) = &client.in_flight else {
             return;
         };
-        let command = match &in_flight.request {
-            Request::Register => Command::RegisterClient,
+        let submission = match &in_flight.request {
+            Request::Register => Submission::Propose(Command::RegisterClient),
+            Request::Operation {
+                operation: Operation::Get { key },
+                read_index: true,
+                ..
+            } => Submission::Read(key.clone()),
             Request::Operation {
                 sequence,
                 operation,
                 ..
-            } => Command::Request {
+            } => Submission::Propose(Command::Request {
                 client_id: client.session.expect("operations need a session"),
                 sequence: *sequence,
                 operation: operation.clone(),
-            },
+            }),
         };
         let tag = in_flight.request.tag();
         let target = match client.leader_guess {
             Some(id) => id,
             None => self.nodes[self.rng.index(self.nodes.len())].id,
         };
-        let mut result = self.propose_to(target, &command, c, tag).map(|()| target);
-        if let Err(ProposeError::NotLeader {
-            leader_hint: Some(leader),
-        }) = result
-        {
+        let mut result = self.submit(target, &submission, c, tag).map(|()| target);
+        if let Err(Some(leader)) = result {
             if leader != target {
-                result = self.propose_to(leader, &command, c, tag).map(|()| leader);
+                result = self.submit(leader, &submission, c, tag).map(|()| leader);
             }
         }
         let client = &mut self.clients[c];
@@ -351,6 +395,60 @@ impl Simulation {
         if let Some(in_flight) = &mut client.in_flight {
             in_flight.retry_at = self.now + wait;
         }
+    }
+
+    /// Hands a request to node `id`. On failure, returns the leader the node
+    /// knows of, if any.
+    fn submit(
+        &mut self,
+        id: NodeId,
+        submission: &Submission,
+        client: usize,
+        tag: Tag,
+    ) -> Result<(), Option<NodeId>> {
+        match submission {
+            Submission::Propose(command) => self
+                .propose_to(id, command, client, tag)
+                .map_err(|ProposeError::NotLeader { leader_hint }| leader_hint),
+            Submission::Read(key) => self
+                .read_from(id, key, client, tag)
+                .map_err(|ReadIndexError::NotLeader { leader_hint }| leader_hint),
+        }
+    }
+
+    /// Starts a ReadIndex read on node `id`.
+    fn read_from(
+        &mut self,
+        id: NodeId,
+        key: &[u8],
+        client: usize,
+        tag: Tag,
+    ) -> Result<(), ReadIndexError> {
+        let now = self.now;
+        let not_reachable = ReadIndexError::NotLeader { leader_hint: None };
+        let Some(node) = self.nodes.iter_mut().find(|n| n.id == id) else {
+            return Err(not_reachable);
+        };
+        if !node.is_active(now) {
+            return Err(not_reachable);
+        }
+        let State::Up { raft, reads, .. } = &mut node.state else {
+            return Err(not_reachable);
+        };
+        self.last_read_id += 1;
+        raft.read_index(self.last_read_id)?;
+        reads.insert(
+            self.last_read_id,
+            PendingRead {
+                pending: Pending {
+                    term: raft.term(),
+                    client,
+                    tag,
+                },
+                key: key.to_vec(),
+            },
+        );
+        Ok(())
     }
 
     fn propose_to(
@@ -468,6 +566,8 @@ impl Simulation {
                 storage,
                 kv,
                 pending,
+                reads,
+                confirmed_reads,
                 ..
             } = &mut node.state
             else {
@@ -522,6 +622,15 @@ impl Simulation {
                     dropped.push(p);
                 }
             }
+            self.stats.reads_confirmed += handle_reads(
+                raft,
+                kv,
+                reads,
+                confirmed_reads,
+                ready.read_states,
+                &mut responses,
+                &mut dropped,
+            );
             // A node that lost leadership tells its waiting clients, which
             // then retry elsewhere. Their proposals may still commit under
             // the next leader; the session table keeps a retry from being
@@ -588,6 +697,7 @@ impl Simulation {
         if self.rng.chance(faults.partition) {
             self.partition();
         }
+        self.isolate_leader(&faults);
         for i in 0..self.nodes.len() {
             if !self.nodes[i].is_active(self.now) {
                 continue;
@@ -617,6 +727,50 @@ impl Simulation {
                 }
                 self.stats.pauses += 1;
                 self.event(&format!("{} paused until tick {until}", self.nodes[i].id));
+            }
+        }
+    }
+
+    /// Starts, keeps up or ends a long isolation of the leader.
+    fn isolate_leader(&mut self, faults: &crate::config::FaultConfig) {
+        if let Some((victim, until)) = self.isolated {
+            if self.now >= until {
+                self.isolated = None;
+                self.network.heal();
+                self.event(&format!("{victim} reconnected"));
+            } else {
+                // Random healing must not end the isolation early.
+                self.cut_off(victim);
+            }
+            return;
+        }
+        if !self.rng.chance(faults.leader_isolation) {
+            return;
+        }
+        let Some(leader) = self
+            .nodes
+            .iter()
+            .find(|n| n.raft().is_some_and(|r| r.role() == Role::Leader))
+            .map(|n| n.id)
+        else {
+            return;
+        };
+        let until = self.now
+            + self
+                .rng
+                .between(faults.isolation_length.0, faults.isolation_length.1);
+        self.isolated = Some((leader, until));
+        self.cut_off(leader);
+        self.stats.leader_isolations += 1;
+        self.event(&format!("leader {leader} isolated until tick {until}"));
+    }
+
+    /// Blocks every link to and from `victim`.
+    fn cut_off(&mut self, victim: NodeId) {
+        for other in self.nodes.iter().map(|n| n.id) {
+            if other != victim {
+                self.network.block(victim, other);
+                self.network.block(other, victim);
             }
         }
     }
@@ -688,6 +842,8 @@ impl Simulation {
                 storage: Box::new(storage),
                 kv: Box::new(KvStore::new(KvConfig::default())),
                 pending: BTreeMap::new(),
+                reads: BTreeMap::new(),
+                confirmed_reads: Vec::new(),
                 paused_until: None,
             };
             node.observed_commit = LogIndex(0);
@@ -698,6 +854,7 @@ impl Simulation {
     }
 
     fn heal_everything(&mut self) {
+        self.isolated = None;
         self.network.heal();
         self.config.faults = crate::config::FaultConfig::none();
         for node in &mut self.nodes {
@@ -832,6 +989,47 @@ fn fnv(mut hash: u64, values: &[u64]) -> u64 {
         }
     }
     hash
+}
+
+/// Moves reads the leader confirmed to `confirmed`, answers those whose
+/// index the state machine has reached, and gives up on unconfirmed reads
+/// once the node is no longer leader in their term. Returns how many reads
+/// were confirmed.
+fn handle_reads(
+    raft: &Raft,
+    kv: &KvStore,
+    reads: &mut BTreeMap<u64, PendingRead>,
+    confirmed: &mut Vec<(LogIndex, PendingRead)>,
+    read_states: Vec<ReadState>,
+    responses: &mut Vec<(Pending, Response)>,
+    dropped: &mut Vec<Pending>,
+) -> u64 {
+    let mut count = 0;
+    for read in read_states {
+        if let Some(waiting) = reads.remove(&read.id) {
+            count += 1;
+            confirmed.push((read.index, waiting));
+        }
+    }
+    // A confirmed read is answered once the state machine reaches its
+    // index, even if the node has lost leadership since.
+    let applied = raft.last_applied();
+    let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(confirmed)
+        .into_iter()
+        .partition(|(index, _)| *index <= applied);
+    *confirmed = waiting;
+    for (_, read) in due {
+        let value = kv.get(&read.key).map(<[u8]>::to_vec);
+        responses.push((read.pending, Response::Value(value)));
+    }
+    // Unconfirmed reads die with the node's leadership in their term.
+    let (role, term) = (raft.role(), raft.term());
+    let (keep, lost): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(reads)
+        .into_iter()
+        .partition(|(_, read)| role == Role::Leader && read.pending.term == term);
+    *reads = keep;
+    dropped.extend(lost.into_values().map(|read| read.pending));
+    count
 }
 
 #[cfg(test)]

@@ -61,6 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `client`: client library with leader discovery, `NotLeader` hints,
   retries with the same sequence number, backoff and a deadline.
 - `raft-kv` binary: `server`, `get`, `put`, `del`, `cas` and `status`.
+- `raft-core`: linearizable reads with ReadIndex (dissertation §6.4):
+  `read_index`, `Ready::read_states`, and a read round carried in
+  `AppendEntries` and echoed in its response. Concurrent reads share
+  confirmation rounds.
+- `server`: reads use ReadIndex by default; `read_mode = "log"` keeps
+  reads through the log for benchmarks.
+- `sim`: three in four client reads use ReadIndex, so the linearizability
+  check covers both read paths. A new fault isolates the leader for 1–3
+  seconds, and clients switch nodes after a timeout.
 - A local five-node cluster: `scripts/cluster.sh` (start, stop, kill and
   restart single nodes, status, logs, clean), `docker-compose.yml` with a
   `Dockerfile`, and example configurations in `config/`.

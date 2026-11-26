@@ -1,6 +1,6 @@
 //! The Raft state machine of a single node.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::config::{Config, ConfigError};
@@ -55,6 +55,20 @@ pub struct Ready {
     /// Newly committed entries to apply to the state machine, in order.
     /// Each committed entry is handed out exactly once.
     pub committed_entries: Vec<Entry>,
+    /// Reads requested with [`Raft::read_index`] that are now safe to serve.
+    /// Serve each one from the state machine once it has applied every entry
+    /// up to the read's `index`.
+    pub read_states: Vec<ReadState>,
+}
+
+/// A linearizable read that the leader has confirmed (Raft dissertation
+/// §6.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadState {
+    /// The id passed to [`Raft::read_index`].
+    pub id: u64,
+    /// The read may be served once the state machine has applied this index.
+    pub index: LogIndex,
 }
 
 impl Ready {
@@ -64,6 +78,7 @@ impl Ready {
             && self.entries.is_empty()
             && self.messages.is_empty()
             && self.committed_entries.is_empty()
+            && self.read_states.is_empty()
     }
 }
 
@@ -90,6 +105,39 @@ impl fmt::Display for ProposeError {
 }
 
 impl std::error::Error for ProposeError {}
+
+/// Why a read was not accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadIndexError {
+    /// Only the leader serves reads. `leader_hint` is the leader this node
+    /// knows of, if any.
+    NotLeader {
+        /// The current leader, if known.
+        leader_hint: Option<NodeId>,
+    },
+}
+
+impl fmt::Display for ReadIndexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self::NotLeader { leader_hint } = *self;
+        ProposeError::NotLeader { leader_hint }.fmt(f)
+    }
+}
+
+impl std::error::Error for ReadIndexError {}
+
+/// A read waiting for the leader to confirm that it is still leader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingRead {
+    id: u64,
+    /// The commit index to serve the read at. `None` until the leader has
+    /// committed an entry in its own term: before that, its commit index may
+    /// be behind what an earlier leader already committed.
+    index: Option<LogIndex>,
+    /// The confirmation round that must reach a majority before the read is
+    /// safe. It started after the read arrived.
+    round: u64,
+}
 
 /// What the leader knows about one follower's log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +186,14 @@ pub struct Raft {
     /// The lowest log index changed since the last `Ready`, if any.
     unstable_from: Option<LogIndex>,
     outbox: Vec<Message>,
+    /// ReadIndex state, only meaningful while leader: the latest
+    /// confirmation round sent, the latest round each follower echoed, the
+    /// latest round a majority echoed, and the reads waiting for one.
+    read_round: u64,
+    acked_rounds: BTreeMap<NodeId, u64>,
+    confirmed_round: u64,
+    pending_reads: VecDeque<PendingRead>,
+    read_states: Vec<ReadState>,
 }
 
 impl Raft {
@@ -173,6 +229,11 @@ impl Raft {
             persisted: hard_state,
             unstable_from: None,
             outbox: Vec::new(),
+            read_round: 0,
+            acked_rounds: BTreeMap::new(),
+            confirmed_round: 0,
+            pending_reads: VecDeque::new(),
+            read_states: Vec::new(),
             config,
         };
         raft.reset_election_timer();
@@ -270,6 +331,47 @@ impl Raft {
         Ok(index)
     }
 
+    /// Starts a linearizable read with the caller's `id` (ReadIndex, Raft
+    /// dissertation §6.4). Only the leader serves reads.
+    ///
+    /// The read shows up in [`Ready::read_states`] once the leader knows two
+    /// things: which commit index the read must observe, and that it was
+    /// still leader after the read arrived. For the first, the leader must
+    /// have committed an entry in its own term (its no-op), because before
+    /// that its commit index may lag behind what an earlier leader
+    /// committed. For the second, a majority must answer a round of
+    /// `AppendEntries` sent after the read arrived; if another node had
+    /// become leader in the meantime, that majority could not exist. The
+    /// read goes through no log entry and no fsync.
+    ///
+    /// Reads that arrive while a round is in flight share the next round, so
+    /// any number of concurrent reads costs at most two rounds of messages.
+    /// If the node stops being leader, its pending reads are dropped and
+    /// never show up; the caller should fail them when the role or term
+    /// changes.
+    pub fn read_index(&mut self, id: u64) -> Result<(), ReadIndexError> {
+        if self.role != Role::Leader {
+            return Err(ReadIndexError::NotLeader {
+                leader_hint: self.leader_id,
+            });
+        }
+        let round = if self.read_round > self.confirmed_round {
+            // A round is in flight; it was sent before this read arrived,
+            // so it proves nothing for it. Wait for the next one.
+            self.read_round + 1
+        } else {
+            self.start_read_round();
+            self.read_round
+        };
+        self.pending_reads.push_back(PendingRead {
+            id,
+            index: None,
+            round,
+        });
+        self.advance_reads();
+        Ok(())
+    }
+
     /// Handles a message from another node.
     ///
     /// Messages addressed to another node or sent by a node outside the
@@ -307,19 +409,25 @@ impl Raft {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_round,
             } => self.handle_append_entries(
                 from,
                 prev_log_index,
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_round,
             ),
             MessageBody::AppendEntriesResponse {
                 success,
                 match_index,
                 conflict_index,
                 conflict_term,
+                read_round,
             } => {
+                // Any answer in our term, even a failed consistency check,
+                // shows the follower still accepts us as leader.
+                self.handle_read_ack(from, read_round);
                 if success {
                     self.handle_append_success(from, match_index);
                 } else {
@@ -353,6 +461,7 @@ impl Raft {
             entries,
             messages: std::mem::take(&mut self.outbox),
             committed_entries,
+            read_states: std::mem::take(&mut self.read_states),
         }
     }
 
@@ -403,6 +512,10 @@ impl Raft {
         self.leader_id = leader;
         self.votes.clear();
         self.progress.clear();
+        // Reads that were not confirmed yet are dropped: this node can no
+        // longer prove it is leader.
+        self.pending_reads.clear();
+        self.acked_rounds.clear();
         self.reset_election_timer();
     }
 
@@ -410,6 +523,11 @@ impl Raft {
         self.role = Role::Leader;
         self.leader_id = Some(self.config.id);
         self.votes.clear();
+
+        self.read_round = 0;
+        self.confirmed_round = 0;
+        self.acked_rounds.clear();
+        self.pending_reads.clear();
 
         let next_index = self.log.last_index().next();
         self.progress = self
@@ -482,6 +600,7 @@ impl Raft {
                 prev_log_term,
                 entries,
                 leader_commit: self.commit_index,
+                read_round: self.read_round,
             },
         );
     }
@@ -526,6 +645,7 @@ impl Raft {
         prev_log_term: Term,
         entries: Vec<Entry>,
         leader_commit: LogIndex,
+        read_round: u64,
     ) {
         match self.role {
             // A candidate that hears from a leader of its own term lost the
@@ -551,6 +671,7 @@ impl Raft {
                     match_index: LogIndex(0),
                     conflict_index,
                     conflict_term,
+                    read_round,
                 },
             );
             return;
@@ -573,6 +694,7 @@ impl Raft {
                 match_index: last_new_index,
                 conflict_index: LogIndex(0),
                 conflict_term: None,
+                read_round,
             },
         );
     }
@@ -695,6 +817,63 @@ impl Raft {
             && self.log.term_at(majority_index) == Some(self.current_term)
         {
             self.commit_index = majority_index;
+            self.advance_reads();
+        }
+    }
+
+    /// Sends a new confirmation round to every follower.
+    fn start_read_round(&mut self) {
+        self.read_round += 1;
+        self.broadcast_append();
+    }
+
+    /// Records that `peer` answered a message of confirmation round `round`.
+    fn handle_read_ack(&mut self, peer: NodeId, round: u64) {
+        if self.role != Role::Leader || round == 0 {
+            return;
+        }
+        let acked = self.acked_rounds.entry(peer).or_default();
+        if round > *acked {
+            *acked = round;
+            self.advance_reads();
+        }
+    }
+
+    /// Releases every read whose round a majority confirmed and whose index
+    /// is known, and starts the next round if reads are waiting for one.
+    fn advance_reads(&mut self) {
+        if self.role != Role::Leader || self.pending_reads.is_empty() {
+            return;
+        }
+        // The highest round a majority has echoed, counting the leader.
+        let mut rounds: Vec<u64> = self
+            .config
+            .peers
+            .iter()
+            .map(|peer| self.acked_rounds.get(peer).copied().unwrap_or(0))
+            .chain([self.read_round])
+            .collect();
+        rounds.sort_unstable_by(|a, b| b.cmp(a));
+        self.confirmed_round = self.confirmed_round.max(rounds[self.quorum() - 1]);
+
+        if self.log.term_at(self.commit_index) == Some(self.current_term) {
+            for read in &mut self.pending_reads {
+                read.index.get_or_insert(self.commit_index);
+            }
+        }
+        while let Some(read) = self.pending_reads.front() {
+            let (Some(index), true) = (read.index, read.round <= self.confirmed_round) else {
+                break;
+            };
+            self.read_states.push(ReadState { id: read.id, index });
+            self.pending_reads.pop_front();
+        }
+        let waiting_for_next = self
+            .pending_reads
+            .back()
+            .is_some_and(|read| read.round > self.read_round);
+        if waiting_for_next && self.confirmed_round == self.read_round {
+            self.start_read_round();
         }
     }
 
@@ -707,11 +886,12 @@ impl Raft {
     fn reject_stale(&mut self, message: &Message) {
         let body = match message.body {
             MessageBody::RequestVote { .. } => MessageBody::RequestVoteResponse { granted: false },
-            MessageBody::AppendEntries { .. } => MessageBody::AppendEntriesResponse {
+            MessageBody::AppendEntries { read_round, .. } => MessageBody::AppendEntriesResponse {
                 success: false,
                 match_index: LogIndex(0),
                 conflict_index: LogIndex(0),
                 conflict_term: None,
+                read_round,
             },
             MessageBody::RequestVoteResponse { .. } | MessageBody::AppendEntriesResponse { .. } => {
                 return

@@ -26,6 +26,13 @@ raft-kv is tested at four levels:
   the leader's no-op, proposals, the commit rule including Raft's Figure 8
   case, fast backtracking in all three variants, follower consistency checks,
   suffix replacement, late duplicate messages, and commit index bounds.
+- **ReadIndex tests** (`crates/raft-core/tests/read_index.rs`): followers
+  refuse reads and name the leader; a read waits for a majority to answer a
+  round sent after it, and an answer to an older round does not count; a
+  failed consistency check still confirms leadership; a new leader holds
+  reads until it has committed in its own term; concurrent reads share
+  rounds; pending reads are dropped when the leader steps down; a single
+  node serves reads at once.
 - **In-memory cluster tests** (`crates/raft-core/tests/cluster.rs`):
   - 3- and 5-node clusters across hundreds of seeds elect exactly one leader,
     re-elect after the leader is cut off, and never elect a leader in a
@@ -94,7 +101,8 @@ raft-kv is tested at four levels:
 - **Cluster tests with the client library** (`crates/client/tests/cluster.rs`):
   three nodes in one process, each in a Tokio runtime of its own so it can
   be killed together with its connections. A client that only knows a
-  follower finds the leader and runs every operation; acknowledged writes
+  follower finds the leader and runs every operation, with reads through
+  ReadIndex and through the log; acknowledged writes
   survive the leader being killed; the old leader restarts from its data
   directory and catches up as a follower; a node without its data
   directory refuses to start.
@@ -121,7 +129,8 @@ With the default settings, a run lasts 3,000 ticks (30 simulated seconds at
 | Message duplication | 2 % of messages |
 | Delay and reordering | 1–4 ticks per message |
 | Latency spikes | 1 % of messages held for 10–80 ticks |
-| Partitions | symmetric splits, isolated nodes, and one-way link cuts; about one per second, healing after a few seconds |
+| Partitions | symmetric splits, isolated nodes, and one-way link cuts; about one per second, healing after a quarter of a second on average |
+| Leader isolation | 0.2 % per tick: the current leader is cut off from all other nodes for 100–300 ticks, whatever else heals |
 | Crashes | 0.1 % per node and tick, down for 10–150 ticks, restarted from persisted state |
 | Leader crashes | 2 % per tick for the current leader |
 | Pauses | 0.1 % per node and tick, frozen for 5–60 ticks |
@@ -140,17 +149,21 @@ Five clients run a key-value workload against the cluster, the way the
 client library will:
 
 - Each client opens a session (`RegisterClient`) and then sends one request
-  at a time: gets through the log, puts, deletes and compare-and-swaps on
-  three keys. Few keys mean many concurrent operations on each.
+  at a time: gets, puts, deletes and compare-and-swaps on three keys. Few
+  keys mean many concurrent operations on each. Three in four gets use
+  ReadIndex; the rest go through the log, so both read paths are checked.
 - Every written value is unique (`client.sequence`), so a read shows exactly
   which write it saw.
 - A request goes to the node the client believes is leader, or to a random
-  node. A follower that knows the leader points the client there.
+  node. A follower that knows the leader points the client there. A client
+  that gets no answer in time tries another node, and one operation in ten
+  starts at a random node, as a newly connected client would.
 - The leader that accepted a proposal answers the client once it applies
   that entry, but only if the entry at that index is still the one it
   proposed. If it loses leadership first, it tells the client, which retries
-  elsewhere with the same sequence number. 5 % of responses are lost on the
-  way back, which also forces retries.
+  elsewhere with the same sequence number. A ReadIndex read is answered once
+  the leader has confirmed it and applied up to its index. 5 % of responses
+  are lost on the way back, which also forces retries.
 - After 400 ticks a client gives up. The operation's outcome is then
   **unknown**: it may still be applied later, or never.
 
@@ -205,8 +218,9 @@ Gong with Lowe's memoization, as Porcupine does:
 - A failure reports the longest valid order the search found and the
   operation that could not follow it.
 
-Across 1,000 seeds, a run checks a median of about 340 completed operations,
-and 70 % of runs include operations with unknown outcomes.
+Across 1,000 seeds, a run checks a median of about 330 completed operations,
+including about 80 ReadIndex reads, and 75 % of runs include operations with
+unknown outcomes.
 
 ### Does it find bugs?
 
@@ -217,12 +231,14 @@ time, and counts how many seeds detect each:
 
 | Injected bug | Seeds that caught it (of 1,000) | Detected as |
 |---|---|---|
-| Vote twice in one term | 913 | election safety |
-| Skip the election restriction | 998 | leader completeness |
-| Commit an older term's entry by counting replicas (Figure 8) | 3 | leader completeness |
-| Follower commits beyond what the leader's message proved | 780 | state machine safety |
+| Vote twice in one term | 934 | election safety |
+| Skip the election restriction | 999 | leader completeness |
+| Commit an older term's entry by counting replicas (Figure 8) | 9 | leader completeness |
+| Follower commits beyond what the leader's message proved | 767 | state machine safety |
 | Storage: shorten a WAL segment before removing the segments after it | 3 | recovery |
-| State machine: apply a retried request again | 962 | linearizability |
+| ReadIndex: serve reads without confirming leadership | 14 | linearizability |
+| ReadIndex: serve reads before the leader commits in its term | 592 | linearizability |
+| State machine: apply a retried request again | 967 | linearizability |
 
 Measured with `scripts/sim-mutations.sh 1000` on the default configuration.
 
@@ -230,11 +246,21 @@ The Figure 8 and follower-commit bugs need rare interleavings: a leader that
 crashes right after its election, and a badly delayed message. They were not
 caught at all until the simulator gained targeted leader crashes, latency
 spikes and small append batches. The client workload made the
-follower-commit bug far easier to hit (1 seed in 1,000 before, 780 now),
+follower-commit bug far easier to hit (1 seed in 1,000 before, 767 now),
 because clients retry and re-route as soon as a leader steps down. The
 Figure 8 bug is still caught only rarely, so a quick local run can miss it;
 the nightly run of 10,000 seeds covers it. Both are also covered by
 dedicated unit tests.
+
+Serving reads without confirming leadership was at first caught by **no**
+seed at all. It needs a deposed leader that still believes it leads while
+the new leader completes writes, and random partitions heal too quickly
+for that. Only after adding long leader isolations (Jepsen's
+partition-leader), and making clients switch nodes after a timeout like the
+client library does, did seeds start to fail, each with a textbook stale
+read: a client reads a value it had already seen overwritten. It is still
+a rare interleaving, covered properly by the nightly run and by the
+dedicated unit test.
 
 Applying a retried request twice breaks none of Raft's invariants: every
 node applies the same log in the same order. Only the linearizability check

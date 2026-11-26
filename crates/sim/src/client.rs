@@ -23,6 +23,8 @@ pub(crate) enum Request {
         sequence: u64,
         operation: Operation,
         history_index: usize,
+        /// For a get: read with ReadIndex instead of through the log.
+        read_index: bool,
     },
 }
 
@@ -40,6 +42,14 @@ impl Request {
             Self::Operation { sequence, .. } => Tag::Sequence(*sequence),
         }
     }
+}
+
+/// A ReadIndex read a leader accepted on a client's behalf, waiting for
+/// confirmation.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingRead {
+    pub(crate) pending: Pending,
+    pub(crate) key: Vec<u8>,
 }
 
 /// A proposal a leader accepted on a client's behalf. When the leader applies

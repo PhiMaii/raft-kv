@@ -51,6 +51,7 @@ fn heartbeat(from: u64, to: u64, commit: u64) -> Message {
             prev_log_term: Term(0),
             entries: Vec::new(),
             leader_commit: LogIndex(commit),
+            read_round: 0,
         },
     }
 }

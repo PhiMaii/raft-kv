@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use client::{Client, ClientConfig, Swapped};
 use raft_core::Role;
-use server::{DataDir, PeerAddress, ServerConfig, StartError};
+use server::{DataDir, PeerAddress, ReadMode, ServerConfig, StartError};
 use tokio::runtime::Runtime;
 use transport::{KvClient, NodeStatus};
 
@@ -76,7 +76,7 @@ fn free_addresses(n: usize) -> Vec<SocketAddr> {
 }
 
 impl Cluster {
-    fn start(size: u64) -> Self {
+    fn start(size: u64, read_mode: ReadMode) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let addresses = free_addresses(usize::try_from(size).expect("small"));
         let nodes = (1..=size)
@@ -97,6 +97,7 @@ impl Cluster {
                         peers,
                         tick_ms: 10,
                         request_timeout_ms: 2_000,
+                        read_mode,
                     },
                     runtime: None,
                 };
@@ -147,7 +148,16 @@ impl Cluster {
 
 #[test]
 fn a_client_that_only_knows_a_follower_finds_the_leader() {
-    let cluster = Cluster::start(3);
+    every_operation_through_a_follower(ReadMode::ReadIndex);
+}
+
+#[test]
+fn reads_through_the_log_give_the_same_answers() {
+    every_operation_through_a_follower(ReadMode::Log);
+}
+
+fn every_operation_through_a_follower(read_mode: ReadMode) {
+    let cluster = Cluster::start(3, read_mode);
     let leader = cluster.leader();
     let follower = (leader + 1) % 3;
     let mut client = cluster.client(&[follower]);
@@ -175,7 +185,7 @@ fn a_client_that_only_knows_a_follower_finds_the_leader() {
 
 #[test]
 fn writes_survive_a_leader_crash_and_the_old_leader_catches_up() {
-    let mut cluster = Cluster::start(3);
+    let mut cluster = Cluster::start(3, ReadMode::ReadIndex);
     let mut client = cluster.client(&[0, 1, 2]);
     cluster.block_on(async {
         client
@@ -229,6 +239,7 @@ fn a_node_without_its_data_directory_refuses_to_start() {
         peers: Vec::new(),
         tick_ms: 10,
         request_timeout_ms: 1_000,
+        read_mode: ReadMode::ReadIndex,
     };
     let runtime = Runtime::new().expect("runtime");
     let result = runtime.block_on(server::start(config, DataDir::MustExist));
