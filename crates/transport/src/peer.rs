@@ -91,7 +91,10 @@ pub struct PeerConfig {
     /// The wait before the first reconnection attempt. It doubles with every
     /// failed attempt, up to `max_backoff`.
     pub min_backoff: Duration,
-    /// The longest wait between reconnection attempts.
+    /// The longest wait between reconnection attempts. Keep it well below
+    /// Raft's election timeout: a node that restarts and hears nothing from
+    /// the leader for that long starts an election, deposing a healthy
+    /// leader.
     pub max_backoff: Duration,
     /// How often to check an idle connection with an HTTP/2 ping, so that a
     /// peer that stopped responding is noticed and reconnected.
@@ -104,7 +107,7 @@ impl Default for PeerConfig {
             queue_capacity: 4096,
             connect_timeout: Duration::from_millis(500),
             min_backoff: Duration::from_millis(50),
-            max_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_millis(100),
             keep_alive_interval: Duration::from_secs(1),
         }
     }

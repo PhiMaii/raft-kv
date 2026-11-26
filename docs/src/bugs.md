@@ -3,6 +3,29 @@
 Every real bug found by the tests is recorded here, newest first. A bug only
 counts once it has a regression test.
 
+## 2026-11-26: Every follower restart deposed a healthy leader
+
+- **Found by:** manual testing of the local cluster script: after
+  `scripts/cluster.sh kill 1` and `start 1`, the term went up every time.
+  Five restarts of a follower caused five elections. Found during
+  development, before merge.
+- **Symptom:** restarting a follower caused an election, so the cluster
+  briefly had no leader and rejected requests, although the leader was
+  healthy throughout.
+- **Root cause:** while the follower was down, the leader's connection to
+  it backed off up to 1 s between reconnection attempts. The restarted
+  follower heard nothing for up to a second, longer than its election
+  timeout (150–300 ms), so it started an election with a higher term, which
+  made the leader step down. Not a safety problem, but a needless loss of
+  availability.
+- **Fix:** cap the reconnection backoff at 100 ms, below the shortest
+  election timeout. Afterwards, five restarts caused no election. A node
+  that is slow to start can still trigger one; Raft's PreVote extension
+  (dissertation §9.6) would prevent that and is listed as future work.
+- **Regression test:** `peer_reconnects_quickly_after_a_long_outage` in
+  `crates/transport/tests/localhost.rs`: after a 1.6 s outage the peer must
+  reconnect within 150 ms. With the old cap it took 972 ms.
+
 ## 2026-11-24: Removed WAL segments could come back after a crash
 
 - **Found by:** code review while writing the storage crash-point test, and

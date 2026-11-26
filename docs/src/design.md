@@ -270,7 +270,9 @@ messages. Each node keeps one stream open to every peer:
 - a `Peer` queues messages for one node and returns at once; a background
   task owns the connection and writes the queue into the stream in order;
 - if the connection breaks, the task reconnects with exponential backoff
-  (50 ms up to 1 s), and HTTP/2 pings notice a peer that stopped answering;
+  (50 ms up to 100 ms, well below the election timeout, so that a node
+  that comes back hears from the leader before it starts an election), and
+  HTTP/2 pings notice a peer that stopped answering;
 - if a peer is unreachable long enough for its queue (4,096 messages) to
   fill up, further messages are dropped. Raft repairs lost messages, and a
   dead peer never slows down the others;

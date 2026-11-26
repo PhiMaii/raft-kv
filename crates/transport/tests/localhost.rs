@@ -140,6 +140,40 @@ impl Process {
     }
 }
 
+/// Regression test: with the backoff capped at 1 s, a node that came back
+/// after a long outage heard nothing from the leader for up to a second,
+/// timed out and started an election, deposing a healthy leader. See the
+/// bug log, 2026-11-26.
+#[tokio::test]
+async fn peer_reconnects_quickly_after_a_long_outage() {
+    let (listener, address) = listen().await;
+    drop(listener);
+    let peer = peer(2, address);
+    // Long enough for the backoff to reach its maximum.
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+
+    let (process, mut received) = Process::start(address, NodeId(2));
+    let started = std::time::Instant::now();
+    let reconnected = timeout(WAIT, async {
+        let mut commit = 1;
+        loop {
+            let _ = peer.send(heartbeat(1, 2, commit));
+            commit += 1;
+            if let Ok(Some(_)) = timeout(Duration::from_millis(10), received.recv()).await {
+                return started.elapsed();
+            }
+        }
+    })
+    .await
+    .expect("a message arrives");
+    process.kill();
+    // Raft's shortest election timeout is 150 ms.
+    assert!(
+        reconnected < Duration::from_millis(150),
+        "took {reconnected:?} to reconnect"
+    );
+}
+
 #[tokio::test]
 async fn peer_reconnects_after_the_node_restarts() {
     let (listener, address) = listen().await;
