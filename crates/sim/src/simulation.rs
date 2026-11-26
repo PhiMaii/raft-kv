@@ -129,6 +129,8 @@ pub(crate) struct Simulation {
     history_clock: u64,
     /// The id of the last ReadIndex read, unique across the run.
     last_read_id: u64,
+    /// A node cut off from all others, and until which tick.
+    isolated: Option<(NodeId, u64)>,
 }
 
 impl Simulation {
@@ -181,6 +183,7 @@ impl Simulation {
             history: Vec::new(),
             history_clock: 0,
             last_read_id: 0,
+            isolated: None,
             config,
         }
     }
@@ -289,7 +292,15 @@ impl Simulation {
                     client.in_flight = None;
                     false
                 }
-                Some(in_flight) => self.now >= in_flight.retry_at,
+                Some(in_flight) => {
+                    let due = self.now >= in_flight.retry_at;
+                    if due {
+                        // No answer in time: like the client library, try
+                        // another node instead of insisting on this one.
+                        client.leader_guess = None;
+                    }
+                    due
+                }
                 None if client.session.is_none() => {
                     client.in_flight = Some(InFlight {
                         request: Request::Register,
@@ -299,6 +310,12 @@ impl Simulation {
                     true
                 }
                 None if start_new && self.rng.chance(self.config.request) => {
+                    if self.rng.chance(self.config.forget_leader) {
+                        // As if a new client process connected: it knows no
+                        // leader and starts at an arbitrary node, possibly a
+                        // deposed leader that does not know it yet.
+                        client.leader_guess = None;
+                    }
                     let (sequence, operation) =
                         client.next_operation(&mut self.rng, self.config.keys);
                     let read_index = matches!(operation, Operation::Get { .. })
@@ -680,6 +697,7 @@ impl Simulation {
         if self.rng.chance(faults.partition) {
             self.partition();
         }
+        self.isolate_leader(&faults);
         for i in 0..self.nodes.len() {
             if !self.nodes[i].is_active(self.now) {
                 continue;
@@ -709,6 +727,50 @@ impl Simulation {
                 }
                 self.stats.pauses += 1;
                 self.event(&format!("{} paused until tick {until}", self.nodes[i].id));
+            }
+        }
+    }
+
+    /// Starts, keeps up or ends a long isolation of the leader.
+    fn isolate_leader(&mut self, faults: &crate::config::FaultConfig) {
+        if let Some((victim, until)) = self.isolated {
+            if self.now >= until {
+                self.isolated = None;
+                self.network.heal();
+                self.event(&format!("{victim} reconnected"));
+            } else {
+                // Random healing must not end the isolation early.
+                self.cut_off(victim);
+            }
+            return;
+        }
+        if !self.rng.chance(faults.leader_isolation) {
+            return;
+        }
+        let Some(leader) = self
+            .nodes
+            .iter()
+            .find(|n| n.raft().is_some_and(|r| r.role() == Role::Leader))
+            .map(|n| n.id)
+        else {
+            return;
+        };
+        let until = self.now
+            + self
+                .rng
+                .between(faults.isolation_length.0, faults.isolation_length.1);
+        self.isolated = Some((leader, until));
+        self.cut_off(leader);
+        self.stats.leader_isolations += 1;
+        self.event(&format!("leader {leader} isolated until tick {until}"));
+    }
+
+    /// Blocks every link to and from `victim`.
+    fn cut_off(&mut self, victim: NodeId) {
+        for other in self.nodes.iter().map(|n| n.id) {
+            if other != victim {
+                self.network.block(victim, other);
+                self.network.block(other, victim);
             }
         }
     }
@@ -792,6 +854,7 @@ impl Simulation {
     }
 
     fn heal_everything(&mut self) {
+        self.isolated = None;
         self.network.heal();
         self.config.faults = crate::config::FaultConfig::none();
         for node in &mut self.nodes {

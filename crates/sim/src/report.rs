@@ -14,6 +14,8 @@ pub struct Stats {
     pub messages_duplicated: u64,
     /// Partitions started.
     pub partitions: u64,
+    /// Times the leader was isolated for a long time.
+    pub leader_isolations: u64,
     /// Node crashes, including crashes while writing.
     pub crashes: u64,
     /// Crashes in the middle of persisting a `Ready`.
