@@ -28,6 +28,9 @@ pub struct SimConfig {
     pub keys: u64,
     /// Chance per tick that an idle client starts a new operation.
     pub request: Chance,
+    /// Chance that a read goes through the log within the client's session
+    /// instead of using ReadIndex, so that both paths are checked.
+    pub log_reads: Chance,
     /// How long a client waits for an answer before sending the request
     /// again, in ticks.
     pub client_timeout: u64,
@@ -136,6 +139,7 @@ impl Default for SimConfig {
             clients: 5,
             keys: 3,
             request: Chance::percent(30),
+            log_reads: Chance::percent(25),
             client_timeout: 40,
             client_deadline: 400,
             faults: FaultConfig::default(),
