@@ -69,6 +69,14 @@ raft-kv is tested at four levels:
     command survives encoding. Disabling deduplication makes the first of
     these fail immediately.
 
+- **Linearizability checker tests** (`crates/sim/src/linearizability.rs`,
+  `crates/sim/src/kv_history.rs`): hand-written histories with known
+  answers (stale reads, reads going back in time, concurrent writes seen in
+  different orders, operations with unknown outcomes), and a comparison
+  against a brute-force search over all orderings on 3,000 random small
+  histories. The checker and the brute-force search must agree on every
+  one, and both answers must be common in the sample.
+
 ## Deterministic simulation
 
 The `sim` crate runs a whole cluster in one process. Network, clock and
@@ -101,8 +109,26 @@ Each seed also picks how many entries an `AppendEntries` may carry (1 to
 1,024). Small batches make followers catch up piece by piece, which opens
 timing windows that some bugs need.
 
-Clients propose commands at random nodes throughout the run, following the
-leader hint once, like the client library will.
+Five clients run a key-value workload against the cluster, the way the
+client library will:
+
+- Each client opens a session (`RegisterClient`) and then sends one request
+  at a time: gets through the log, puts, deletes and compare-and-swaps on
+  three keys. Few keys mean many concurrent operations on each.
+- Every written value is unique (`client.sequence`), so a read shows exactly
+  which write it saw.
+- A request goes to the node the client believes is leader, or to a random
+  node. A follower that knows the leader points the client there.
+- The leader that accepted a proposal answers the client once it applies
+  that entry, but only if the entry at that index is still the one it
+  proposed. If it loses leadership first, it tells the client, which retries
+  elsewhere with the same sequence number. 5 % of responses are lost on the
+  way back, which also forces retries.
+- After 400 ticks a client gives up. The operation's outcome is then
+  **unknown**: it may still be applied later, or never.
+
+Every invocation and completion is recorded in a history for the
+linearizability check.
 
 ### Invariants
 
@@ -118,40 +144,81 @@ Checked on every tick (log matching every 10 ticks):
 
 At the end of a run all faults are healed. After 500 fault-free ticks the
 cluster must have exactly one leader, and every node must hold the leader's
-log and have applied all of it (**liveness**). A panic inside a node also
-fails the run.
+log and have applied all of it (**liveness**). Every node's key-value state
+must then be identical. A panic inside a node also fails the run.
+
+Finally, every key is read once more, and the whole history must be
+**linearizable** (see below). The final reads turn a lost acknowledged write
+into a visible stale read.
+
+### Linearizability checking
+
+A history is linearizable if every operation can be placed at one point in
+time between its invocation and its completion, so that executing the
+operations one by one in that order gives exactly the results the clients
+saw. This is the guarantee raft-kv promises to clients, and the only check
+that looks at the system from the outside: the Raft invariants above can
+all hold while clients still see wrong answers, for example if the state
+machine applied a retried request twice.
+
+The checker (`sim::linearizability`) implements the algorithm of Wing and
+Gong with Lowe's memoization, as Porcupine does:
+
+- It searches for a valid order depth first, and caches every pair of
+  (operations placed so far, register value). A state reached along two
+  different orders is explored only once, which keeps the search fast in
+  practice although it is exponential in the worst case.
+- Keys are independent registers, so a history is linearizable exactly if
+  each key's part of it is. Every key is checked on its own.
+- Operations with an unknown outcome complete "at the end of time": the
+  search may place them anywhere after their invocation, including after
+  everything else, which is the same as never.
+- A step budget turns a search that runs away into an explicit failure
+  instead of a hang. Typical runs stay far below it.
+- A failure reports the longest valid order the search found and the
+  operation that could not follow it.
+
+Across 1,000 seeds, a run checks a median of about 340 completed operations,
+and 70 % of runs include operations with unknown outcomes.
 
 ### Does it find bugs?
 
 A simulator that never fails proves nothing on its own. To check that it can
-find real bugs, `scripts/sim-mutations.sh` injects four classic Raft bugs
-into `raft-core`, one at a time, and counts how many seeds detect each:
+find real bugs, `scripts/sim-mutations.sh` injects known bugs into
+`raft-core`, the storage layer and the key-value state machine, one at a
+time, and counts how many seeds detect each:
 
 | Injected bug | Seeds that caught it (of 1,000) | Detected as |
 |---|---|---|
-| Vote twice in one term | 940 | election safety |
-| Skip the election restriction | 1,000 | leader completeness |
-| Commit an older term's entry by counting replicas (Figure 8) | 7 | leader completeness |
-| Follower commits beyond what the leader's message proved | 1 | state machine safety |
-| Storage: shorten a WAL segment before removing the segments after it | 5 | recovery |
+| Vote twice in one term | 913 | election safety |
+| Skip the election restriction | 998 | leader completeness |
+| Commit an older term's entry by counting replicas (Figure 8) | 3 | leader completeness |
+| Follower commits beyond what the leader's message proved | 780 | state machine safety |
+| Storage: shorten a WAL segment before removing the segments after it | 3 | recovery |
+| State machine: apply a retried request again | 962 | linearizability |
 
 Measured with `scripts/sim-mutations.sh 1000` on the default configuration.
 
 The Figure 8 and follower-commit bugs need rare interleavings: a leader that
 crashes right after its election, and a badly delayed message. They were not
 caught at all until the simulator gained targeted leader crashes, latency
-spikes and small append batches. Even now a single seed catches them rarely,
-so a quick local run can miss them; the nightly run of 10,000 seeds catches
-each of them about 10 to 70 times. Both are also covered by dedicated unit
-tests.
+spikes and small append batches. The client workload made the
+follower-commit bug far easier to hit (1 seed in 1,000 before, 780 now),
+because clients retry and re-route as soon as a leader steps down. The
+Figure 8 bug is still caught only rarely, so a quick local run can miss it;
+the nightly run of 10,000 seeds covers it. Both are also covered by
+dedicated unit tests.
+
+Applying a retried request twice breaks none of Raft's invariants: every
+node applies the same log in the same order. Only the linearizability check
+sees it, because clients get answers that no single execution order can
+explain.
 
 Not every bug is reachable from the simulator. Writing a `Ready`'s entries
 before its hard state can leave a node whose term is lower than its last
 entry's term, but Raft's vote majority keeps that node from winning an
 election in such a term, so no seed ever turns it into a visible violation.
 The storage crash-point test checks that invariant directly instead.
-
-Not simulated yet: client-visible linearizability (comes with the checker).
 
 ### Regression seeds
 
