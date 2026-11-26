@@ -1,0 +1,63 @@
+# A five-node raft-kv cluster.
+#
+#   docker compose up -d --build
+#   docker compose exec node1 raft-kv put greeting hello
+#   docker compose exec node1 raft-kv get greeting
+#   docker compose exec node1 raft-kv status
+#   docker compose kill node3        # crash a node
+#   docker compose start node3       # it recovers from its volume
+#   docker compose down -v           # stop and delete all data
+#
+# Client commands run inside a container, because the nodes refer to each
+# other (and point clients to the leader) by their Compose host names.
+#
+# Each node keeps its state in its own volume. --init lets a node create its
+# data directory on first start; deleting a single node's volume would make
+# it rejoin with an empty disk, which Raft does not allow (see the docs on
+# lost data directories). Delete volumes only for the whole cluster at once.
+
+x-node: &node
+  build: .
+  image: raft-kv
+  environment:
+    RAFT_KV_CLUSTER: node1:7001,node2:7001,node3:7001,node4:7001,node5:7001
+  restart: "no"
+
+services:
+  node1:
+    <<: *node
+    hostname: node1
+    command: ["server", "--config", "/etc/raft-kv/node1.toml", "--init"]
+    ports: ["7001:7001"]
+    volumes: ["node1:/data"]
+  node2:
+    <<: *node
+    hostname: node2
+    command: ["server", "--config", "/etc/raft-kv/node2.toml", "--init"]
+    ports: ["7002:7001"]
+    volumes: ["node2:/data"]
+  node3:
+    <<: *node
+    hostname: node3
+    command: ["server", "--config", "/etc/raft-kv/node3.toml", "--init"]
+    ports: ["7003:7001"]
+    volumes: ["node3:/data"]
+  node4:
+    <<: *node
+    hostname: node4
+    command: ["server", "--config", "/etc/raft-kv/node4.toml", "--init"]
+    ports: ["7004:7001"]
+    volumes: ["node4:/data"]
+  node5:
+    <<: *node
+    hostname: node5
+    command: ["server", "--config", "/etc/raft-kv/node5.toml", "--init"]
+    ports: ["7005:7001"]
+    volumes: ["node5:/data"]
+
+volumes:
+  node1:
+  node2:
+  node3:
+  node4:
+  node5:
