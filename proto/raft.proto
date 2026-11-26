@@ -1,12 +1,72 @@
-// Raft RPCs between cluster nodes.
+// Raft messages between cluster nodes.
 //
-// Messages are defined in milestone 7 (gRPC transport). See
-// docs/src/spec.md, sections 2.3 and 2.7.
+// raft-core treats every message as one-way: a response is a message of its
+// own that travels back later, not the return value of a call. The wire
+// protocol does the same. Each node opens one long-lived stream to each peer
+// and sends its messages down it in order; nothing is returned per message.
+// See ADR 0005 in the documentation.
 
 syntax = "proto3";
 
 package raftkv.raft.v1;
 
 service Raft {
-  // RequestVote, AppendEntries and InstallSnapshot are added in milestone 7.
+  // Delivers a sender's messages to the receiving node, in order. The stream
+  // stays open for as long as the connection does.
+  rpc Send(stream RaftMessage) returns (SendSummary);
+}
+
+message RaftMessage {
+  uint64 from = 1;
+  uint64 to = 2;
+  // The sender's current term.
+  uint64 term = 3;
+  oneof body {
+    RequestVote request_vote = 4;
+    RequestVoteResponse request_vote_response = 5;
+    AppendEntries append_entries = 6;
+    AppendEntriesResponse append_entries_response = 7;
+  }
+}
+
+message RequestVote {
+  uint64 last_log_index = 1;
+  uint64 last_log_term = 2;
+}
+
+message RequestVoteResponse {
+  bool granted = 1;
+}
+
+message AppendEntries {
+  uint64 prev_log_index = 1;
+  uint64 prev_log_term = 2;
+  repeated Entry entries = 3;
+  uint64 leader_commit = 4;
+}
+
+message AppendEntriesResponse {
+  bool success = 1;
+  uint64 match_index = 2;
+  uint64 conflict_index = 3;
+  optional uint64 conflict_term = 4;
+}
+
+message Entry {
+  uint64 term = 1;
+  uint64 index = 2;
+  oneof payload {
+    // An empty entry a new leader appends in its term.
+    Noop noop = 3;
+    // An opaque command for the replicated state machine.
+    bytes command = 4;
+  }
+}
+
+message Noop {}
+
+// Sent when the sender closes its stream.
+message SendSummary {
+  // How many messages the receiver accepted on this stream.
+  uint64 received = 1;
 }
