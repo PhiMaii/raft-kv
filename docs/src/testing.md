@@ -77,6 +77,20 @@ raft-kv is tested at four levels:
   histories. The checker and the brute-force search must agree on every
   one, and both answers must be common in the sample.
 
+- **Transport tests** (`crates/transport`): every Raft message and every
+  error survives encoding to protobuf bytes and back, and incomplete
+  messages are rejected. Over real TCP connections on localhost:
+  1,000 messages arrive in order; a peer waits for a node that is not up
+  yet, and reconnects after the node is killed and restarted (the node runs
+  in a runtime of its own, so killing it closes its connections like a
+  crashed process); a message for the wrong node is refused; and the client
+  API round-trips every operation against a real `KvStore`, including a
+  retried compare-and-swap that gets its original answer, rejections, leader
+  hints and a request without a header.
+
+  The simulator does not cover this crate; the real-process harness
+  (milestone 14) will.
+
 ## Deterministic simulation
 
 The `sim` crate runs a whole cluster in one process. Network, clock and

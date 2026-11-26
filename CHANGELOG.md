@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deadlines run a key-value workload in every run. The simulator applies
   committed entries to each node's `KvStore`, checks that all replicas end
   up identical, and checks the recorded history for linearizability.
+- `transport`: gRPC services generated from `/proto` with a vendored
+  `protoc`. Raft messages travel as one long-lived, ordered stream per peer
+  with a bounded queue and reconnection (ADR 0005). The client API
+  (`RegisterClient`, `Get`, `Put`, `Delete`, `CompareAndSwap`) returns
+  typed errors, including `NotLeader` with a leader hint; `KvService`
+  delegates to a `KvHandler`, and `KvClient` is a typed client.
 - Cargo workspace with one crate per component (`raft-core`, `storage`,
   `transport`, `kv`, `server`, `client`, `sim`, `chaos`, `bench`, `cli`).
 - Documentation site (mdBook) with the specification, design overview,
