@@ -247,6 +247,52 @@ leader's timestamps in the log, never from a node's own clock, so all nodes
 expire the same sessions at the same log position. See
 [ADR 0004](adr/0004-session-expiry-by-leader-timestamps.md).
 
+## Network
+
+The `transport` crate carries two gRPC services, both defined in `/proto`.
+It only moves messages and translates types; leaders, retries and
+replication are other crates' business.
+
+### Between nodes
+
+Raft messages are one-way: a response is a message of its own, not the
+result of a call (see [ADR 0005](adr/0005-one-way-message-streams.md)). So
+the `Raft` service has a single method, `Send`, which takes a stream of
+messages. Each node keeps one stream open to every peer:
+
+- a `Peer` queues messages for one node and returns at once; a background
+  task owns the connection and writes the queue into the stream in order;
+- if the connection breaks, the task reconnects with exponential backoff
+  (50 ms up to 1 s), and HTTP/2 pings notice a peer that stopped answering;
+- if a peer is unreachable long enough for its queue (4,096 messages) to
+  fill up, further messages are dropped. Raft repairs lost messages, and a
+  dead peer never slows down the others;
+- the receiving `RaftService` checks each message and passes it to the local
+  node through a channel. A malformed message, or one addressed to another
+  node (a misconfigured cluster), ends the stream with an error.
+
+### Client API
+
+The `KeyValue` service offers `RegisterClient`, `Get`, `Put`, `Delete` and
+`CompareAndSwap`. Writes carry a header with the session id and sequence
+number. Every response holds either its result or a typed error:
+
+| Error | Meaning | What the client does |
+|---|---|---|
+| `NotLeader` | This node is not the leader; carries the leader's id and address if known | Retries at the hinted node |
+| `SessionExpired` | The session is unknown or expired | Registers again; the last write's outcome is unknown |
+| `StaleSequence` | The request is older than the session's latest | Nothing; it is a delayed duplicate |
+| `KeyTooLarge`, `ValueTooLarge` | A size limit was exceeded | Gives up |
+| `Unavailable` | No answer in time, e.g. no leader or no majority | Retries with the same sequence number |
+| `Internal` | A bug or a corrupt entry | Gives up |
+
+gRPC status codes are used only for requests the server cannot interpret
+and for failures of the call itself. Either way, a write whose call failed
+has an unknown outcome and is retried with the same sequence number.
+
+`KvService` turns requests into calls on a `KvHandler`, which the server
+implements, and `KvClient` is the matching typed client for a single node.
+
 ## Snapshots
 
 _Written in milestone 11._

@@ -1,13 +1,139 @@
-// Client-facing key-value API.
+// Client-facing key-value API. See docs/src/spec.md, section 2.8.
 //
-// Messages are defined in milestone 7 (gRPC transport). See
-// docs/src/spec.md, section 2.8.
+// Every response carries either its result or an Error. gRPC status codes
+// are used only for requests the server cannot even interpret (for example
+// a missing field) and for transport failures.
 
 syntax = "proto3";
 
 package raftkv.kv.v1;
 
 service KeyValue {
-  // RegisterClient, Put, Get, Delete and CompareAndSwap are added in
-  // milestone 7.
+  // Opens a client session. Writes must carry the session's id.
+  rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
+  // Reads a key. Linearizable.
+  rpc Get(GetRequest) returns (GetResponse);
+  // Sets a key to a value.
+  rpc Put(PutRequest) returns (PutResponse);
+  // Removes a key.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  // Sets a key only if its current value is the expected one.
+  rpc CompareAndSwap(CompareAndSwapRequest) returns (CompareAndSwapResponse);
+}
+
+// Identifies a write: the client's session and the request's sequence
+// number. A retry repeats the sequence number of the request it repeats, so
+// the write is applied at most once.
+message RequestHeader {
+  uint64 client_id = 1;
+  uint64 sequence = 2;
+}
+
+message Error {
+  ErrorCode code = 1;
+  // Human-readable details.
+  string message = 2;
+  // With NOT_LEADER: the node this node believes is leader, if any.
+  optional LeaderHint leader = 3;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  // This node is not the leader; retry at the hinted leader.
+  ERROR_CODE_NOT_LEADER = 1;
+  // The session does not exist or expired; register again.
+  ERROR_CODE_SESSION_EXPIRED = 2;
+  // The request is older than the session's latest one.
+  ERROR_CODE_STALE_SEQUENCE = 3;
+  ERROR_CODE_KEY_TOO_LARGE = 4;
+  ERROR_CODE_VALUE_TOO_LARGE = 5;
+  // The cluster could not answer in time. A write may or may not have been
+  // applied; retry it with the same sequence number.
+  ERROR_CODE_UNAVAILABLE = 6;
+  ERROR_CODE_INTERNAL = 7;
+}
+
+message LeaderHint {
+  uint64 id = 1;
+  // The leader's client API address, for example "10.0.0.3:7001".
+  string address = 2;
+}
+
+message RegisterClientRequest {}
+
+message RegisterClientResponse {
+  oneof outcome {
+    uint64 client_id = 1;
+    Error error = 2;
+  }
+}
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message GetResponse {
+  oneof outcome {
+    Value value = 1;
+    Error error = 2;
+  }
+}
+
+// A key's value, which is absent if the key does not exist.
+message Value {
+  optional bytes value = 1;
+}
+
+message PutRequest {
+  RequestHeader header = 1;
+  bytes key = 2;
+  bytes value = 3;
+}
+
+message PutResponse {
+  oneof outcome {
+    Written written = 1;
+    Error error = 2;
+  }
+}
+
+message Written {}
+
+message DeleteRequest {
+  RequestHeader header = 1;
+  bytes key = 2;
+}
+
+message DeleteResponse {
+  oneof outcome {
+    Deleted deleted = 1;
+    Error error = 2;
+  }
+}
+
+message Deleted {
+  // Whether the key existed.
+  bool existed = 1;
+}
+
+message CompareAndSwapRequest {
+  RequestHeader header = 1;
+  bytes key = 2;
+  // The value the key must have; absent means the key must not exist.
+  optional bytes expected = 3;
+  bytes new = 4;
+}
+
+message CompareAndSwapResponse {
+  oneof outcome {
+    Swapped swapped = 1;
+    Error error = 2;
+  }
+}
+
+message Swapped {
+  // Whether the comparison matched and the value was replaced.
+  bool succeeded = 1;
+  // The key's value before the operation.
+  optional bytes previous = 2;
 }
