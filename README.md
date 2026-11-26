@@ -91,7 +91,8 @@ docker compose down -v
 ```
 
 Client commands run inside a container because the nodes know each other
-by their Compose host names.
+by their Compose host names. `scripts/docker-smoke-test.sh` runs the same
+steps as an automated check (CI runs it too).
 
 ## Testing
 

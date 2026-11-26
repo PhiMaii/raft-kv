@@ -1,0 +1,38 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - Dockerfile
+      - .dockerignore
+      - docker-compose.yml
+      - config/docker/**
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - proto/**
+      - scripts/docker-smoke-test.sh
+      - .github/workflows/docker.yml
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-test:
+    name: Compose smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      # Builds the image, starts the five-node cluster, crashes the leader and
+      # checks that reads and writes keep working. Prints the node logs and
+      # tears the cluster down (`docker compose down -v`) when it exits.
+      - run: scripts/docker-smoke-test.sh
