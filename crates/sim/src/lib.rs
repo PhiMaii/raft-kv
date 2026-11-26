@@ -3,8 +3,9 @@
 //! A run places a whole Raft cluster in one process: a simulated network, a
 //! virtual clock and simulated disks, all driven by a single random seed.
 //! While the run injects faults (message loss, duplication, delay and
-//! reordering, symmetric and asymmetric partitions, crashes and pauses), the
-//! simulator checks Raft's safety properties after every tick:
+//! reordering, symmetric and asymmetric partitions, long leader isolations,
+//! crashes and pauses), the simulator checks Raft's safety properties after
+//! every tick:
 //!
 //! - **Election safety:** at most one leader per term.
 //! - **Log matching:** logs that agree on an entry's index and term agree on

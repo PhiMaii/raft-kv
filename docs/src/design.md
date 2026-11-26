@@ -136,14 +136,44 @@ catches up from the leader's next message.
 
 ## Read path
 
-Until ReadIndex lands (milestone 10), a read goes through the log: the
-leader proposes a `Read` command, and answers when that entry is applied.
-The leader only answers for entries committed in its own term, so a leader
-that was deposed without knowing it can never answer, and the read is
-linearizable. `Read` needs no session, because applying it twice changes
-nothing. It stays available afterwards, to compare against ReadIndex in the
-benchmarks. See [ADR 0003](adr/0003-readindex-over-leases.md) for the
-ReadIndex decision.
+Reads use **ReadIndex** (Raft dissertation §6.4): they are linearizable but
+write nothing to the log and need no fsync. See
+[ADR 0003](adr/0003-readindex-over-leases.md) for why leader leases are not
+used.
+
+`Raft::read_index(id)` accepts a read on the leader. The read becomes a
+`ReadState { id, index }` in `Ready::read_states` once two things hold:
+
+1. **The leader knows the commit index the read must observe.** A new
+   leader's commit index can be behind what the previous leader already
+   committed, so reads wait until the leader has committed an entry in its
+   own term, its no-op. The read's index is the commit index from then on.
+2. **The leader was still leader after the read arrived.** It sends a round
+   of `AppendEntries` and waits until a majority, counting itself, has
+   answered that round. Each `AppendEntries` carries the leader's current
+   `read_round`, which the follower echoes; answers to messages sent before
+   the read carry an older round and do not count. Any answer in the
+   leader's term counts, even a failed consistency check, since it shows
+   the follower still accepts this leader. If another node had become
+   leader in a later term, that majority could not have answered.
+
+The server then answers from its key-value store as soon as it has applied
+everything up to the read's index.
+
+**Batching:** at most one round is in flight. Reads that arrive meanwhile
+wait for the next round, which starts as soon as the current one is
+confirmed, so any number of concurrent reads costs at most two rounds.
+Ordinary replication messages carry the round too, so under write load
+confirmation often comes for free.
+
+**Leadership changes:** a leader that steps down drops its unconfirmed
+reads, and the server answers them with `NotLeader`. A read that was
+already confirmed is still answered: it was valid when it was confirmed.
+
+**Reads through the log** remain available with `read_mode = "log"` in the
+node's configuration: the leader proposes a `Read` command and answers when
+it is applied. This costs an fsync per batch on every node and exists to
+measure what ReadIndex saves.
 
 ## Storage and recovery
 
