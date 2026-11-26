@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kv::{ClientId, Command, Envelope, KvConfig, KvStore, Operation, Response};
-use raft_core::{LogIndex, Message, MessageBody, NodeId, Term};
+use raft_core::{LogIndex, Message, MessageBody, NodeId, Role, Term};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -16,8 +16,8 @@ use tonic::transport::Server;
 use transport::proto::kv::key_value_client::KeyValueClient;
 use transport::proto::kv::PutRequest;
 use transport::{
-    ApiError, ClientError, KvClient, KvHandler, KvService, LeaderHint, Peer, PeerConfig,
-    RaftService, Swapped, WriteId,
+    ApiError, ClientError, KvClient, KvHandler, KvService, LeaderHint, Member, NodeStatus, Peer,
+    PeerConfig, RaftService, Swapped, WriteId,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -242,6 +242,26 @@ impl KvHandler for LocalStore {
             operation,
         })))
     }
+
+    fn status(&self) -> impl Future<Output = Result<NodeStatus, ApiError>> + Send {
+        ready(Ok(test_status()))
+    }
+}
+
+fn test_status() -> NodeStatus {
+    NodeStatus {
+        id: NodeId(1),
+        role: Role::Leader,
+        term: Term(3),
+        leader: Some(NodeId(1)),
+        commit_index: LogIndex(4),
+        last_applied: LogIndex(4),
+        last_log_index: LogIndex(5),
+        peers: vec![Member {
+            id: NodeId(2),
+            address: "127.0.0.1:7002".to_owned(),
+        }],
+    }
 }
 
 /// A node that is not the leader.
@@ -269,6 +289,10 @@ impl KvHandler for Follower {
         _operation: Operation,
     ) -> impl Future<Output = Result<Response, ApiError>> + Send {
         ready(Err(ApiError::NotLeader(None)))
+    }
+
+    fn status(&self) -> impl Future<Output = Result<NodeStatus, ApiError>> + Send {
+        ready(Ok(test_status()))
     }
 }
 
@@ -382,6 +406,13 @@ async fn followers_point_to_the_leader() {
         client.delete(id, b"k".to_vec()).await,
         Err(ClientError::Api(ApiError::NotLeader(None)))
     ));
+}
+
+#[tokio::test]
+async fn status_reaches_the_client() {
+    let address = serve_kv(LocalStore::new()).await;
+    let mut client = KvClient::connect(&address).await.expect("connect");
+    assert_eq!(client.status().await.expect("status"), test_status());
 }
 
 #[tokio::test]

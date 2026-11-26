@@ -19,6 +19,8 @@ service KeyValue {
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   // Sets a key only if its current value is the expected one.
   rpc CompareAndSwap(CompareAndSwapRequest) returns (CompareAndSwapResponse);
+  // Reports this node's view of the cluster. Any node answers.
+  rpc Status(StatusRequest) returns (StatusResponse);
 }
 
 // Identifies a write: the client's session and the request's sequence
@@ -136,4 +138,39 @@ message Swapped {
   bool succeeded = 1;
   // The key's value before the operation.
   optional bytes previous = 2;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  oneof outcome {
+    NodeStatus status = 1;
+    Error error = 2;
+  }
+}
+
+message NodeStatus {
+  uint64 id = 1;
+  Role role = 2;
+  uint64 term = 3;
+  // The leader this node knows of, if any.
+  optional uint64 leader = 4;
+  uint64 commit_index = 5;
+  uint64 last_applied = 6;
+  uint64 last_log_index = 7;
+  // The other members of the cluster.
+  repeated Member peers = 8;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_FOLLOWER = 1;
+  ROLE_CANDIDATE = 2;
+  ROLE_LEADER = 3;
+}
+
+message Member {
+  uint64 id = 1;
+  // The member's address, for example "10.0.0.3:7001".
+  string address = 2;
 }

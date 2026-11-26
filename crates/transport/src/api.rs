@@ -11,7 +11,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use kv::{ClientId, Operation, Rejection, Response};
-use raft_core::NodeId;
+use raft_core::{LogIndex, NodeId, Role, Term};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Status};
 
@@ -138,6 +138,91 @@ pub struct WriteId {
     pub sequence: u64,
 }
 
+/// A member of the cluster and its address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    /// The member's id.
+    pub id: NodeId,
+    /// The member's address, for example `"10.0.0.3:7001"`.
+    pub address: String,
+}
+
+/// A node's view of the cluster, as reported by the `Status` call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeStatus {
+    /// The node's id.
+    pub id: NodeId,
+    /// The node's current role.
+    pub role: Role,
+    /// The node's current term.
+    pub term: Term,
+    /// The leader the node knows of, if any.
+    pub leader: Option<NodeId>,
+    /// The highest log index known to be committed.
+    pub commit_index: LogIndex,
+    /// The highest log index applied to the state machine.
+    pub last_applied: LogIndex,
+    /// The index of the last entry in the node's log.
+    pub last_log_index: LogIndex,
+    /// The other members of the cluster.
+    pub peers: Vec<Member>,
+}
+
+impl NodeStatus {
+    fn to_wire(&self) -> wire::NodeStatus {
+        let role = match self.role {
+            Role::Follower => wire::Role::Follower,
+            Role::Candidate => wire::Role::Candidate,
+            Role::Leader => wire::Role::Leader,
+        };
+        wire::NodeStatus {
+            id: self.id.0,
+            role: role.into(),
+            term: self.term.0,
+            leader: self.leader.map(|id| id.0),
+            commit_index: self.commit_index.0,
+            last_applied: self.last_applied.0,
+            last_log_index: self.last_log_index.0,
+            peers: self
+                .peers
+                .iter()
+                .map(|peer| wire::Member {
+                    id: peer.id.0,
+                    address: peer.address.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn from_wire(status: wire::NodeStatus) -> Result<Self, ApiError> {
+        let role = match wire::Role::try_from(status.role) {
+            Ok(wire::Role::Follower) => Role::Follower,
+            Ok(wire::Role::Candidate) => Role::Candidate,
+            Ok(wire::Role::Leader) => Role::Leader,
+            Ok(wire::Role::Unspecified) | Err(_) => {
+                return Err(ApiError::Internal(format!("unknown role {}", status.role)))
+            }
+        };
+        Ok(Self {
+            id: NodeId(status.id),
+            role,
+            term: Term(status.term),
+            leader: status.leader.map(NodeId),
+            commit_index: LogIndex(status.commit_index),
+            last_applied: LogIndex(status.last_applied),
+            last_log_index: LogIndex(status.last_log_index),
+            peers: status
+                .peers
+                .into_iter()
+                .map(|peer| Member {
+                    id: NodeId(peer.id),
+                    address: peer.address,
+                })
+                .collect(),
+        })
+    }
+}
+
 /// What the server does with requests. Implemented by the server, which
 /// runs them through Raft.
 pub trait KvHandler: Send + Sync + 'static {
@@ -154,6 +239,9 @@ pub trait KvHandler: Send + Sync + 'static {
         id: WriteId,
         operation: Operation,
     ) -> impl Future<Output = Result<Response, ApiError>> + Send;
+
+    /// Reports the node's view of the cluster.
+    fn status(&self) -> impl Future<Output = Result<NodeStatus, ApiError>> + Send;
 }
 
 /// The gRPC key-value service, backed by a [`KvHandler`].
@@ -286,6 +374,20 @@ impl<H: KvHandler> KeyValue for KvService<H> {
             Err(error) => Outcome::Error(error.to_wire()),
         };
         Ok(tonic::Response::new(wire::CompareAndSwapResponse {
+            outcome: Some(outcome),
+        }))
+    }
+
+    async fn status(
+        &self,
+        _request: Request<wire::StatusRequest>,
+    ) -> Result<tonic::Response<wire::StatusResponse>, Status> {
+        use wire::status_response::Outcome;
+        let outcome = match self.handler.status().await {
+            Ok(status) => Outcome::Status(status.to_wire()),
+            Err(error) => Outcome::Error(error.to_wire()),
+        };
+        Ok(tonic::Response::new(wire::StatusResponse {
             outcome: Some(outcome),
         }))
     }
@@ -458,6 +560,22 @@ impl KvClient {
     }
 }
 
+impl KvClient {
+    /// Asks the node for its view of the cluster.
+    pub async fn status(&mut self) -> Result<NodeStatus, ClientError> {
+        use wire::status_response::Outcome;
+        let response = self
+            .inner
+            .status(wire::StatusRequest {})
+            .await?
+            .into_inner();
+        match response.outcome.ok_or_else(missing_outcome)? {
+            Outcome::Status(status) => Ok(NodeStatus::from_wire(status)?),
+            Outcome::Error(error) => Err(ApiError::from_wire(error).into()),
+        }
+    }
+}
+
 fn header(id: WriteId) -> wire::RequestHeader {
     wire::RequestHeader {
         client_id: id.client_id.0,
@@ -486,6 +604,26 @@ mod tests {
         ];
         for error in errors {
             assert_eq!(ApiError::from_wire(error.to_wire()), error);
+        }
+    }
+
+    #[test]
+    fn status_round_trips() {
+        for role in [Role::Follower, Role::Candidate, Role::Leader] {
+            let status = NodeStatus {
+                id: NodeId(2),
+                role,
+                term: Term(5),
+                leader: Some(NodeId(4)),
+                commit_index: LogIndex(10),
+                last_applied: LogIndex(9),
+                last_log_index: LogIndex(11),
+                peers: vec![Member {
+                    id: NodeId(1),
+                    address: "127.0.0.1:7001".to_owned(),
+                }],
+            };
+            assert_eq!(NodeStatus::from_wire(status.to_wire()), Ok(status));
         }
     }
 
