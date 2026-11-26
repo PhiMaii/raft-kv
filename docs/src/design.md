@@ -136,8 +136,14 @@ catches up from the leader's next message.
 
 ## Read path
 
-_Written in milestone 10._ See [ADR 0003](adr/0003-readindex-over-leases.md)
-for the decision.
+Until ReadIndex lands (milestone 10), a read goes through the log: the
+leader proposes a `Read` command, and answers when that entry is applied.
+The leader only answers for entries committed in its own term, so a leader
+that was deposed without knowing it can never answer, and the read is
+linearizable. `Read` needs no session, because applying it twice changes
+nothing. It stays available afterwards, to compare against ReadIndex in the
+benchmarks. See [ADR 0003](adr/0003-readindex-over-leases.md) for the
+ReadIndex decision.
 
 ## Storage and recovery
 
@@ -215,7 +221,8 @@ command. The commands are:
 | `Put { key, value }` | Sets the key | `Written` |
 | `Delete { key }` | Removes the key | `Deleted { existed }` |
 | `CompareAndSwap { key, expected, new }` | Sets `key` to `new` if its value equals `expected` (`None` = absent) | `Swapped { succeeded, previous }` |
-| `Get { key }` | Reads through the log (benchmark comparison only) | `Value(..)` |
+| `Read { key }` | Reads through the log, without a session | `Value(..)` |
+| `Get { key }` | Reads through the log within a session (used by the simulator) | `Value(..)` |
 
 Normal reads do not go through the log; they use ReadIndex and read the
 local store. Keys are at most 1 KiB and values at most 1 MiB by default;
@@ -292,6 +299,58 @@ has an unknown outcome and is retried with the same sequence number.
 
 `KvService` turns requests into calls on a `KvHandler`, which the server
 implements, and `KvClient` is the matching typed client for a single node.
+
+## Running a node
+
+The `server` crate turns the pieces into a process. `raft-kv server
+--config node1.toml` reads the node's id, listen address, data directory
+and peers from a TOML file, recovers its state from the data directory, and
+serves both gRPC services on one address.
+
+### The node loop
+
+One task owns the node's state: `Raft`, its `Storage`, the `KvStore` and
+the clients waiting for answers. The gRPC handlers talk to it through
+channels, so nothing needs a lock. Each round of the loop:
+
+1. takes one event (a tick, a message from a peer or a client request), then
+   drains whatever else is already waiting, up to 256 of each;
+2. persists the resulting hard state and entries with one fsync for the
+   whole round, before anything is sent;
+3. sends the messages to the peers' queues;
+4. applies committed entries to the `KvStore` and answers waiting clients.
+
+A client request becomes a proposal, remembered with its index and the
+leader's term. It is answered when the entry at that index is applied, but
+only if the entry still has that term; otherwise it was replaced in a leader
+change, and the client gets `Unavailable` and retries. When the node stops
+being leader, every waiting client gets `NotLeader` right away. Their
+entries may still commit under the next leader, which is why retries carry
+the same sequence number. A request that does not commit within the request
+timeout (5 s) gets `Unavailable`.
+
+A tick is 10 ms, so elections time out after 150–300 ms and leaders send
+heartbeats every 50 ms. If a write to disk fails, the node stops: it can no
+longer keep the promises its votes and acknowledgements made.
+
+### A lost data directory
+
+A node refuses to start if its data directory does not exist, unless it is
+started with `--init`. With an empty log and no memory of its votes, a node
+that lost its disk could vote twice in one term or help elect a leader that
+lacks committed entries. Bringing such a node back safely needs membership
+changes (spec F3); `--init` is only for a node that has never run.
+
+### The client library
+
+A `Client` gets the addresses of all nodes and finds the leader itself. It
+sends each request to the node it believes is leader and follows
+`NotLeader` hints. When a node does not answer, is not the leader and knows
+of none, or reports `Unavailable`, the client moves on to the next node,
+backing off from 50 ms up to 1 s, until the request's deadline (30 s)
+passes. Writes are retried with the same sequence number, so a write is
+applied at most once. A client has one session and one request in flight,
+so a program with several concurrent workers uses one client per worker.
 
 ## Snapshots
 
