@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kv::{Command, Envelope, KvStore, Response};
-use raft_core::{EntryPayload, LogIndex, Message, NodeId, ProposeError, Raft, Role, Term};
+use raft_core::{
+    EntryPayload, LogIndex, Message, NodeId, ProposeError, Raft, ReadIndexError, Role, Term,
+};
 use storage::{FsDisk, Storage, StorageError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
@@ -29,8 +31,23 @@ pub(crate) enum Request {
         command: Command,
         reply: oneshot::Sender<Result<Response, ApiError>>,
     },
+    /// Read a key with ReadIndex.
+    Read {
+        key: Vec<u8>,
+        reply: oneshot::Sender<Result<Option<Vec<u8>>, ApiError>>,
+    },
     /// Report the node's status.
     Status { reply: oneshot::Sender<NodeStatus> },
+}
+
+/// A ReadIndex read waiting for the leader to confirm it.
+#[derive(Debug)]
+struct WaitingRead {
+    key: Vec<u8>,
+    /// The term the read was accepted in. Raft drops pending reads when the
+    /// node loses leadership, so a read from an earlier term never shows up.
+    term: Term,
+    reply: oneshot::Sender<Result<Option<Vec<u8>>, ApiError>>,
 }
 
 /// A client waiting for the entry at some index to be applied.
@@ -49,6 +66,11 @@ pub(crate) struct Node {
     peers: BTreeMap<NodeId, Peer>,
     addresses: BTreeMap<NodeId, String>,
     pending: BTreeMap<LogIndex, Waiter>,
+    /// Reads waiting for confirmation, by read id.
+    reads: BTreeMap<u64, WaitingRead>,
+    next_read_id: u64,
+    /// Confirmed reads waiting for the state machine to reach their index.
+    confirmed_reads: Vec<(LogIndex, WaitingRead)>,
     /// The role, term and leader last logged, to log changes.
     observed: (Role, Term, Option<NodeId>),
 }
@@ -69,6 +91,9 @@ impl Node {
             peers,
             addresses,
             pending: BTreeMap::new(),
+            reads: BTreeMap::new(),
+            next_read_id: 0,
+            confirmed_reads: Vec::new(),
             observed,
         }
     }
@@ -134,6 +159,23 @@ impl Node {
                     }
                 }
             }
+            Request::Read { key, reply } => {
+                if key.len() > self.kv.config().max_key_len {
+                    let _ = reply.send(Err(ApiError::KeyTooLarge));
+                    return;
+                }
+                self.next_read_id += 1;
+                let id = self.next_read_id;
+                match self.raft.read_index(id) {
+                    Ok(()) => {
+                        let term = self.raft.term();
+                        self.reads.insert(id, WaitingRead { key, term, reply });
+                    }
+                    Err(ReadIndexError::NotLeader { leader_hint }) => {
+                        let _ = reply.send(Err(ApiError::NotLeader(self.hint(leader_hint))));
+                    }
+                }
+            }
             Request::Status { reply } => {
                 let _ = reply.send(self.status());
             }
@@ -169,9 +211,30 @@ impl Node {
                     let _ = waiter.reply.send(answer);
                 }
             }
+            for read in ready.read_states {
+                if let Some(waiting) = self.reads.remove(&read.id) {
+                    self.confirmed_reads.push((read.index, waiting));
+                }
+            }
+            self.serve_reads();
         }
         self.observe_role();
         Ok(())
+    }
+
+    /// Answers confirmed reads whose index the state machine has reached.
+    /// A confirmed read stays valid even if the node has stopped being
+    /// leader since: it was confirmed while the node was leader.
+    fn serve_reads(&mut self) {
+        let applied = self.raft.last_applied();
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.confirmed_reads)
+            .into_iter()
+            .partition(|(index, _)| *index <= applied);
+        self.confirmed_reads = waiting;
+        for (_, read) in due {
+            let value = self.kv.get(&read.key).map(<[u8]>::to_vec);
+            let _ = read.reply.send(Ok(value));
+        }
     }
 
     /// Logs role changes, and releases waiting clients when the node is no
@@ -190,6 +253,24 @@ impl Node {
             let hint = self.hint(self.raft.leader_id());
             for (_, waiter) in std::mem::take(&mut self.pending) {
                 let _ = waiter.reply.send(Err(ApiError::NotLeader(hint.clone())));
+            }
+        }
+        // Unconfirmed reads from an earlier leadership will never be
+        // confirmed: Raft dropped them when the node stepped down.
+        let (role, term) = (self.raft.role(), self.raft.term());
+        if self
+            .reads
+            .values()
+            .any(|read| role != Role::Leader || read.term != term)
+        {
+            let hint = self.hint(self.raft.leader_id());
+            let reads = std::mem::take(&mut self.reads);
+            for (id, read) in reads {
+                if role == Role::Leader && read.term == term {
+                    self.reads.insert(id, read);
+                } else {
+                    let _ = read.reply.send(Err(ApiError::NotLeader(hint.clone())));
+                }
             }
         }
     }

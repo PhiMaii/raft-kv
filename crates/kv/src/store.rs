@@ -115,6 +115,11 @@ impl KvStore {
         }
     }
 
+    /// The store's limits and timeouts.
+    pub fn config(&self) -> &KvConfig {
+        &self.config
+    }
+
     /// Applies the command in the log entry at `index`.
     pub fn apply(&mut self, index: u64, bytes: &[u8]) -> Response {
         let envelope = match Envelope::decode(bytes) {

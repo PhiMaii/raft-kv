@@ -6,6 +6,7 @@ use kv::{ClientId, Command, Operation, Response};
 use tokio::sync::{mpsc, oneshot};
 use transport::{ApiError, KvHandler, NodeStatus, WriteId};
 
+use crate::config::ReadMode;
 use crate::node::Request;
 
 /// Hands client requests to the node and waits for the answers.
@@ -13,27 +14,45 @@ use crate::node::Request;
 pub(crate) struct Handler {
     requests: mpsc::Sender<Request>,
     timeout: Duration,
+    read_mode: ReadMode,
 }
 
 impl Handler {
-    pub(crate) fn new(requests: mpsc::Sender<Request>, timeout: Duration) -> Self {
-        Self { requests, timeout }
+    pub(crate) fn new(
+        requests: mpsc::Sender<Request>,
+        timeout: Duration,
+        read_mode: ReadMode,
+    ) -> Self {
+        Self {
+            requests,
+            timeout,
+            read_mode,
+        }
     }
 
-    /// Replicates `command` and returns the state machine's response.
-    async fn propose(&self, command: Command) -> Result<Response, ApiError> {
+    /// Sends a request built around a reply channel and waits for the
+    /// answer, up to the request timeout.
+    async fn ask<T>(
+        &self,
+        request: impl FnOnce(oneshot::Sender<Result<T, ApiError>>) -> Request,
+    ) -> Result<T, ApiError> {
         let (reply, answer) = oneshot::channel();
         self.requests
-            .send(Request::Propose { command, reply })
+            .send(request(reply))
             .await
             .map_err(|_| stopped())?;
         match tokio::time::timeout(self.timeout, answer).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => Err(stopped()),
             Err(_) => Err(ApiError::Unavailable(
-                "the request did not commit in time".to_owned(),
+                "the request did not complete in time".to_owned(),
             )),
         }
+    }
+
+    /// Replicates `command` and returns the state machine's response.
+    async fn propose(&self, command: Command) -> Result<Response, ApiError> {
+        self.ask(|reply| Request::Propose { command, reply }).await
     }
 }
 
@@ -56,14 +75,18 @@ impl KvHandler for Handler {
         }
     }
 
-    /// Reads through the log until `ReadIndex` is implemented: the read is
-    /// answered when its entry is applied, which is linearizable because
-    /// the leader only answers for entries committed in its own term.
+    /// Reads with ReadIndex, or through the log if so configured. A read
+    /// through the log is answered when its entry is applied, which is
+    /// linearizable because the leader only answers for entries committed
+    /// in its own term.
     async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, ApiError> {
-        match self.propose(Command::Read { key }).await? {
-            Response::Value(value) => Ok(value),
-            Response::Rejected(rejection) => Err(ApiError::from_rejection(rejection)),
-            other => Err(unexpected(&other)),
+        match self.read_mode {
+            ReadMode::ReadIndex => self.ask(|reply| Request::Read { key, reply }).await,
+            ReadMode::Log => match self.propose(Command::Read { key }).await? {
+                Response::Value(value) => Ok(value),
+                Response::Rejected(rejection) => Err(ApiError::from_rejection(rejection)),
+                other => Err(unexpected(&other)),
+            },
         }
     }
 

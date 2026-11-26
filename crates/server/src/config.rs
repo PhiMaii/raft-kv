@@ -46,6 +46,22 @@ pub struct ServerConfig {
     /// answers `Unavailable`, in milliseconds.
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
+    /// How reads are made linearizable.
+    #[serde(default)]
+    pub read_mode: ReadMode,
+}
+
+/// How the leader serves linearizable reads.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadMode {
+    /// Confirm leadership with one round of heartbeats, then read local
+    /// state (ReadIndex). No log entry, no fsync.
+    #[default]
+    ReadIndex,
+    /// Append the read to the log and answer once it is applied. Slower;
+    /// kept to measure what ReadIndex saves.
+    Log,
 }
 
 /// Another member of the cluster.
@@ -162,6 +178,10 @@ mod tests {
         assert_eq!(config.peers.len(), 2);
         assert_eq!(config.tick(), Duration::from_millis(10));
         assert_eq!(config.request_timeout(), Duration::from_secs(5));
+        assert_eq!(config.read_mode, ReadMode::ReadIndex);
+        let log_reads: ServerConfig =
+            toml::from_str(&format!("read_mode = \"log\"\n{VALID}")).expect("valid");
+        assert_eq!(log_reads.read_mode, ReadMode::Log);
     }
 
     #[test]
