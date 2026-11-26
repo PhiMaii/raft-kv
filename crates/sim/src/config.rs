@@ -19,8 +19,22 @@ pub struct SimConfig {
     /// seed, from 1 to 1024, so that runs also cover followers that catch up
     /// one entry at a time.
     pub max_entries_per_append: Option<usize>,
-    /// Chance per tick that a client proposes a command to a random node.
-    pub propose: Chance,
+    /// Number of concurrent clients. Each has its own session and at most
+    /// one request in flight.
+    pub clients: usize,
+    /// Number of distinct keys the clients use. Few keys mean many
+    /// concurrent operations on each, which is where linearizability bugs
+    /// show.
+    pub keys: u64,
+    /// Chance per tick that an idle client starts a new operation.
+    pub request: Chance,
+    /// How long a client waits for an answer before sending the request
+    /// again, in ticks.
+    pub client_timeout: u64,
+    /// How long a client keeps retrying an operation before it gives up, in
+    /// ticks. The operation's outcome is then unknown: it may still take
+    /// effect later, which the linearizability check must allow for.
+    pub client_deadline: u64,
     /// Faults to inject.
     pub faults: FaultConfig,
 }
@@ -119,7 +133,11 @@ impl Default for SimConfig {
             settle_ticks: 500,
             log_check_interval: 10,
             max_entries_per_append: None,
-            propose: Chance::percent(30),
+            clients: 5,
+            keys: 3,
+            request: Chance::percent(30),
+            client_timeout: 40,
+            client_deadline: 400,
             faults: FaultConfig::default(),
         }
     }

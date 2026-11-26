@@ -147,9 +147,27 @@ fn describe(op: &KvOp) -> String {
     };
     match &op.outcome {
         Outcome::Returned { at, output } => {
-            format!("{client}: {what} [{}..{at}] = {output:?}", op.call)
+            format!("{client}: {what} [{}..{at}] = {}", op.call, result(output))
         }
         Outcome::Unknown => format!("{client}: {what} [{}..?] = unknown", op.call),
+    }
+}
+
+fn result(response: &Response) -> String {
+    let value = |v: &Option<Vec<u8>>| v.as_deref().map_or_else(|| "absent".to_owned(), show);
+    match response {
+        Response::Value(v) => value(v),
+        Response::Written => "ok".to_owned(),
+        Response::Deleted { existed } => format!("deleted (existed: {existed})"),
+        Response::Swapped {
+            succeeded,
+            previous,
+        } => format!(
+            "{} (was {})",
+            if *succeeded { "swapped" } else { "not swapped" },
+            value(previous)
+        ),
+        other => format!("{other:?}"),
     }
 }
 

@@ -66,6 +66,7 @@ fn main() -> ExitCode {
     let started = Instant::now();
     let mut failures = Vec::new();
     let mut committed = 0;
+    let mut operations = 0;
     let mut crashes = 0;
     let mut partitions = 0;
 
@@ -73,6 +74,7 @@ fn main() -> ExitCode {
         match sim::run(seed, &args.config) {
             Ok(report) => {
                 committed += report.stats.committed_index;
+                operations += report.stats.operations_completed + report.stats.operations_unknown;
                 crashes += report.stats.crashes;
                 partitions += report.stats.partitions;
                 if args.single {
@@ -88,7 +90,7 @@ fn main() -> ExitCode {
 
     println!(
         "{} seeds ({}..{}) in {:.1?}: {} failed; {committed} entries committed, \
-         {crashes} crashes, {partitions} partitions",
+         {operations} client operations checked, {crashes} crashes, {partitions} partitions",
         args.count,
         args.start,
         args.start + args.count,

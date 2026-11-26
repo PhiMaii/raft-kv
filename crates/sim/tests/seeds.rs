@@ -62,6 +62,19 @@ fn random_seeds_pass_under_faults() {
         "runs should commit a meaningful number of entries: min {}, median {median}",
         committed[0]
     );
+
+    // The linearizability check needs real histories: operations that
+    // complete, and some whose outcome stays unknown.
+    let mut completed: Vec<u64> = stats.iter().map(|s| s.operations_completed).collect();
+    completed.sort_unstable();
+    let median = completed[completed.len() / 2];
+    assert!(
+        completed[0] > 10 && median > 150,
+        "runs should complete client operations: min {}, median {median}",
+        completed[0]
+    );
+    assert!(total(|s| s.operations_unknown) > 0, "no unknown outcomes");
+    assert!(total(|s| s.responses_lost) > 0, "no responses lost");
 }
 
 #[test]
