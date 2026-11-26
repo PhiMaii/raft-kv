@@ -67,6 +67,7 @@ fn heartbeat(from: NodeId, term: u64) -> Message {
             prev_log_term: Term(0),
             entries: Vec::new(),
             leader_commit: LogIndex(0),
+            read_round: 0,
         },
     )
 }
@@ -342,6 +343,7 @@ fn leader_steps_down_on_a_higher_term() {
             match_index: LogIndex(0),
             conflict_index: LogIndex(0),
             conflict_term: None,
+            read_round: 0,
         },
     ));
     assert_eq!(raft.role(), Role::Follower);

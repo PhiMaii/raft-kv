@@ -71,6 +71,7 @@ fn append(term: u64, prev_index: u64, prev_term: u64, entries: Vec<Entry>, commi
             prev_log_term: Term(prev_term),
             entries,
             leader_commit: LogIndex(commit),
+            read_round: 0,
         },
     }
 }
@@ -85,6 +86,7 @@ fn success(from: NodeId, term: Term, match_index: u64) -> Message {
             match_index: LogIndex(match_index),
             conflict_index: LogIndex(0),
             conflict_term: None,
+            read_round: 0,
         },
     }
 }
@@ -99,6 +101,7 @@ fn conflict(from: NodeId, term: Term, index: u64, conflict_term: Option<u64>) ->
             match_index: LogIndex(0),
             conflict_index: LogIndex(index),
             conflict_term: conflict_term.map(Term),
+            read_round: 0,
         },
     }
 }
@@ -115,6 +118,7 @@ fn response(raft: &mut Raft) -> (bool, u64, u64, Option<u64>) {
                     match_index,
                     conflict_index,
                     conflict_term,
+                    ..
                 },
             ..
         }] => (

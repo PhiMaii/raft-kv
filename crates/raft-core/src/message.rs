@@ -42,6 +42,10 @@ pub enum MessageBody {
         entries: Vec<Entry>,
         /// The leader's commit index.
         leader_commit: LogIndex,
+        /// The leader's current ReadIndex confirmation round. The follower
+        /// echoes it, so the leader can tell which responses prove it was
+        /// still leader after a read arrived.
+        read_round: u64,
     },
     /// The answer to [`MessageBody::AppendEntries`].
     AppendEntriesResponse {
@@ -57,5 +61,7 @@ pub enum MessageBody {
         /// On failure, the term of the follower's entry at `prev_log_index`,
         /// if it has one. Lets the leader skip a whole term at once.
         conflict_term: Option<Term>,
+        /// The `read_round` of the request this answers.
+        read_round: u64,
     },
 }
