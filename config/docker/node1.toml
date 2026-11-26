@@ -1,0 +1,20 @@
+# Node 1 of the Docker Compose cluster. See docker-compose.yml.
+id = 1
+listen = "0.0.0.0:7001"
+data_dir = "/data"
+
+[[peers]]
+id = 2
+address = "node2:7001"
+
+[[peers]]
+id = 3
+address = "node3:7001"
+
+[[peers]]
+id = 4
+address = "node4:7001"
+
+[[peers]]
+id = 5
+address = "node5:7001"
