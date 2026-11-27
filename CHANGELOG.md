@@ -88,6 +88,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sim`: every seed picks its snapshot frequency, log tail and chunk size;
   restarted nodes recover from their snapshot; a long-run test checks that
   logs stay bounded; three snapshot bugs added to the mutation tests.
+- `raft-core`: batched replication (`batch_appends`): while an append to a
+  follower waits for its answer, new entries wait with it and go out
+  together; an idle leader still sends at once. Appends are limited by
+  `max_append_bytes` as well as by entry count.
+  `Message::may_send_before_persisting` marks a leader's replication
+  messages, which may go out before its fsync.
+- `server`: `batch_appends`, `max_append_bytes` and `send_before_persist`
+  settings, all on by default; the leader's fsync overlaps with sending its
+  appends.
+- `sim`: every seed turns batching and early sends on or off, and counts
+  the entries sent.
 - A local five-node cluster: `scripts/cluster.sh` (start, stop, kill and
   restart single nodes, status, logs, clean), `docker-compose.yml` with a
   `Dockerfile`, and example configurations in `config/`.
@@ -96,5 +107,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation site (mdBook) with the specification, design overview,
   architecture decision records, testing methodology and bug log.
 - CI: formatting, Clippy, tests, dependency audit and documentation build.
+
+### Fixed
+
+- `raft-core`: answers to heartbeats and ReadIndex rounds no longer start
+  extra chains of appends to a follower that is behind, which piled up into
+  a message storm under load (see the bug log).
 - Documentation site on GitHub Pages, published from `main`, with the
   mdBook and the API reference.
