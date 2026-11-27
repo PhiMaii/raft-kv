@@ -998,7 +998,9 @@ impl Raft {
         });
         let len = snapshot.data.len();
         let start = usize::try_from(offset).map_or(len, |offset| offset.min(len));
-        let end = start.saturating_add(self.config.snapshot_chunk_size).min(len);
+        let end = start
+            .saturating_add(self.config.snapshot_chunk_size)
+            .min(len);
         self.send(
             peer,
             MessageBody::InstallSnapshot {

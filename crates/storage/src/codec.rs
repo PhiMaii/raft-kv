@@ -8,8 +8,11 @@
 //!
 //! **Hard state file:** `crc: u32 | term: u64 | has_vote: u8 | vote: u64`,
 //! where `crc` covers the 17 bytes after it.
+//!
+//! **Snapshot file:** `crc: u32 | index: u64 | term: u64 | data`, where
+//! `crc` covers everything after it and `data` runs to the end of the file.
 
-use raft_core::{Entry, EntryPayload, HardState, LogIndex, NodeId, Term};
+use raft_core::{Entry, EntryPayload, HardState, LogIndex, NodeId, Snapshot, Term};
 
 /// Bytes before a record's payload.
 pub(crate) const HEADER_LEN: usize = 8;
@@ -138,6 +141,41 @@ pub(crate) fn decode_hard_state(data: &[u8]) -> Result<HardState, String> {
     })
 }
 
+const SNAPSHOT_HEADER_LEN: usize = 20;
+
+/// Encodes the snapshot file.
+pub(crate) fn encode_snapshot(snapshot: &Snapshot) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SNAPSHOT_HEADER_LEN + snapshot.data.len());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&snapshot.index.0.to_le_bytes());
+    out.extend_from_slice(&snapshot.term.0.to_le_bytes());
+    out.extend_from_slice(&snapshot.data);
+    let crc = crc32fast::hash(&out[4..]);
+    out[..4].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// Decodes the snapshot file.
+pub(crate) fn decode_snapshot(data: &[u8]) -> Result<Snapshot, String> {
+    if data.len() < SNAPSHOT_HEADER_LEN {
+        return Err(format!(
+            "snapshot file of {} bytes is too short",
+            data.len()
+        ));
+    }
+    let crc = u32::from_le_bytes(data[0..4].try_into().expect("4 bytes"));
+    if crc32fast::hash(&data[4..]) != crc {
+        return Err("snapshot checksum mismatch".to_owned());
+    }
+    let index = u64::from_le_bytes(data[4..12].try_into().expect("8 bytes"));
+    let term = u64::from_le_bytes(data[12..20].try_into().expect("8 bytes"));
+    Ok(Snapshot {
+        index: LogIndex(index),
+        term: Term(term),
+        data: data[SNAPSHOT_HEADER_LEN..].into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +241,20 @@ mod tests {
         let mut bad_kind = vec![0u8; 17];
         bad_kind[16] = 9;
         assert!(decode_entry(&bad_kind).is_err());
+    }
+
+    #[test]
+    fn snapshots_round_trip_and_detect_corruption() {
+        let snapshot = Snapshot {
+            index: LogIndex(40),
+            term: Term(3),
+            data: b"state".as_slice().into(),
+        };
+        let mut data = encode_snapshot(&snapshot);
+        assert_eq!(decode_snapshot(&data), Ok(snapshot));
+        data[22] ^= 1;
+        assert!(decode_snapshot(&data).is_err());
+        assert!(decode_snapshot(&data[..10]).is_err());
     }
 
     #[test]

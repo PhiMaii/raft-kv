@@ -267,7 +267,10 @@ fn entries_after_a_matching_snapshot_are_kept() {
     raft.step(install(3, 1, 0, b"abc", 3));
     let ready = raft.take_ready();
     let snapshot = ready.snapshot.expect("installed");
-    assert_eq!((snapshot.index, &*snapshot.data), (LogIndex(3), &b"abc"[..]));
+    assert_eq!(
+        (snapshot.index, &*snapshot.data),
+        (LogIndex(3), &b"abc"[..])
+    );
     assert_eq!(raft.log().first_index(), LogIndex(4));
     assert_eq!(raft.log().last_index(), LogIndex(5));
     // Storage replaces its log with the snapshot, so the kept entries are
