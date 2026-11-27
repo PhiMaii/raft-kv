@@ -4,6 +4,11 @@
 //! storage, the key-value store and the requests waiting for their entries
 //! to commit. Everything else talks to it through channels, so none of that
 //! state needs a lock.
+//!
+//! The one exception is serializing a snapshot, which takes time
+//! proportional to the store's size. The node hands a clone of the store
+//! (cheap: its maps are persistent) to a blocking thread and keeps applying;
+//! the finished snapshot comes back through a channel.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +20,7 @@ use raft_core::{
 use storage::{FsDisk, Storage, StorageError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use transport::{ApiError, LeaderHint, Member, NodeStatus, Peer};
 
 /// The most messages or requests taken from a channel before the node
@@ -73,6 +78,16 @@ pub(crate) struct Node {
     confirmed_reads: Vec<(LogIndex, WaitingRead)>,
     /// The role, term and leader last logged, to log changes.
     observed: (Role, Term, Option<NodeId>),
+    /// Command bytes applied since the last snapshot.
+    applied_bytes: u64,
+    /// Take a snapshot once `applied_bytes` reaches this.
+    snapshot_threshold: u64,
+    /// Whether a snapshot is being serialized.
+    snapshotting: bool,
+    /// Where serialized snapshots arrive: the index they were taken at and
+    /// their data.
+    snapshots: mpsc::Sender<(LogIndex, Vec<u8>)>,
+    finished_snapshots: Option<mpsc::Receiver<(LogIndex, Vec<u8>)>>,
 }
 
 impl Node {
@@ -84,6 +99,7 @@ impl Node {
         addresses: BTreeMap<NodeId, String>,
     ) -> Self {
         let observed = (raft.role(), raft.term(), raft.leader_id());
+        let (snapshots, finished_snapshots) = mpsc::channel(1);
         Self {
             raft,
             storage,
@@ -95,7 +111,19 @@ impl Node {
             next_read_id: 0,
             confirmed_reads: Vec::new(),
             observed,
+            applied_bytes: 0,
+            snapshot_threshold: u64::MAX,
+            snapshotting: false,
+            snapshots,
+            finished_snapshots: Some(finished_snapshots),
         }
+    }
+
+    /// Takes a snapshot whenever `bytes` of commands have been applied
+    /// since the last one. Without this, the node never takes one.
+    pub(crate) fn with_snapshot_threshold(mut self, bytes: u64) -> Self {
+        self.snapshot_threshold = bytes;
+        self
     }
 
     /// Runs until both channels are closed, or until storage fails. A node
@@ -109,9 +137,16 @@ impl Node {
     ) -> Result<(), StorageError> {
         let mut ticker = tokio::time::interval(tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut finished_snapshots = self
+            .finished_snapshots
+            .take()
+            .expect("a node runs only once");
         loop {
             tokio::select! {
                 _ = ticker.tick() => self.raft.tick(),
+                Some((index, data)) = finished_snapshots.recv() => {
+                    self.finish_snapshot(index, data)?;
+                }
                 message = inbox.recv() => match message {
                     Some(message) => self.raft.step(message),
                     None => return Ok(()),
@@ -197,10 +232,28 @@ impl Node {
                     }
                 }
             }
+            if let Some(snapshot) = &ready.snapshot {
+                self.kv = KvStore::restore(*self.kv.config(), &snapshot.data).map_err(|error| {
+                    StorageError::Corrupt {
+                        file: "snapshot from the leader".to_owned(),
+                        offset: 0,
+                        reason: error.to_string(),
+                    }
+                })?;
+                self.applied_bytes = 0;
+                info!(
+                    index = snapshot.index.0,
+                    bytes = snapshot.data.len(),
+                    "installed a snapshot from the leader"
+                );
+            }
             for entry in ready.committed_entries {
                 let waiter = self.pending.remove(&entry.index);
                 let response = match &entry.payload {
-                    EntryPayload::Command(bytes) => Some(self.kv.apply(entry.index.0, bytes)),
+                    EntryPayload::Command(bytes) => {
+                        self.applied_bytes += bytes.len() as u64;
+                        Some(self.kv.apply(entry.index.0, bytes))
+                    }
                     EntryPayload::Noop => None,
                 };
                 if let Some(waiter) = waiter {
@@ -217,8 +270,47 @@ impl Node {
                 }
             }
             self.serve_reads();
+            self.maybe_snapshot();
         }
         self.observe_role();
+        Ok(())
+    }
+
+    /// Starts serializing a snapshot of the store on a blocking thread, if
+    /// enough has been applied since the last one and none is in progress.
+    fn maybe_snapshot(&mut self) {
+        if self.snapshotting || self.applied_bytes < self.snapshot_threshold {
+            return;
+        }
+        self.snapshotting = true;
+        self.applied_bytes = 0;
+        // Every committed entry has been applied, so the store is exactly
+        // the state at the applied index.
+        let index = self.raft.last_applied();
+        let kv = self.kv.clone();
+        let snapshots = self.snapshots.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = snapshots.blocking_send((index, kv.snapshot()));
+        });
+    }
+
+    /// Compacts the log with a serialized snapshot and makes it durable.
+    fn finish_snapshot(&mut self, index: LogIndex, data: Vec<u8>) -> Result<(), StorageError> {
+        self.snapshotting = false;
+        match self.raft.compact(index, data) {
+            Ok(snapshot) => {
+                let keep_from = self.raft.log().first_index();
+                tokio::task::block_in_place(|| self.storage.save_snapshot(&snapshot, keep_from))?;
+                info!(
+                    index = index.0,
+                    bytes = snapshot.data.len(),
+                    log_start = keep_from.0,
+                    "took a snapshot"
+                );
+            }
+            // A newer snapshot arrived from the leader meanwhile.
+            Err(error) => warn!(%error, "snapshot discarded"),
+        }
         Ok(())
     }
 

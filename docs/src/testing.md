@@ -33,6 +33,16 @@ raft-kv is tested at four levels:
   reads until it has committed in its own term; concurrent reads share
   rounds; pending reads are dropped when the leader steps down; a single
   node serves reads at once.
+- **Snapshot tests** (`crates/raft-core/tests/snapshot.rs`): compaction
+  keeps the configured tail and refuses snapshots of unapplied or older
+  state; a follower cut off while the leader compacts catches up from a
+  chunked snapshot and applies later entries as usual; a follower keeps the
+  entries after a snapshot whose last entry it has and discards a
+  conflicting log; chunks that arrive twice, early or from an unknown
+  transfer are handled; a snapshot the follower has already committed past
+  is acknowledged at once; duplicate acknowledgements do not multiply
+  chunks; a node restarts from its snapshot, and refuses a log that does
+  not continue it.
 - **In-memory cluster tests** (`crates/raft-core/tests/cluster.rs`):
   - 3- and 5-node clusters across hundreds of seeds elect exactly one leader,
     re-elect after the leader is cut off, and never elect a leader in a
@@ -57,6 +67,13 @@ raft-kv is tested at four levels:
     partially surviving unsynced bytes. Recovery must always succeed and
     yield the old state or a valid partial state on the way to the new one,
     and the node's term must never be lower than its last entry's term;
+  - snapshots: saving one removes the segments before it, one from the
+    leader replaces the whole log, a damaged snapshot is an error, and so
+    is a log that starts after the snapshot. Saving and installing a
+    snapshot are crashed after every disk operation too: recovery must
+    return the old state or the new one, the log must always continue the
+    snapshot, and no entry of the old log may survive after a new snapshot
+    from the leader;
   - a property test (`proptest`) with random appends and suffix
     replacements, then a cut at a random byte of the last segment: recovery
     returns a prefix of the expected log and keeps everything before the cut
@@ -70,11 +87,14 @@ raft-kv is tested at four levels:
   - idle sessions expire by leader timestamps, active ones do not, and a
     leader clock behind the previous one does not move time backwards;
   - size limits, and malformed entries rejected without changing state;
+  - snapshots keep the session table, so a retry after a restore still
+    gets its original answer; damaged snapshots are rejected;
   - **property tests**: random workloads with retries must behave exactly
     like a plain map where each request is applied once, and two stores fed
-    the same log must end up identical; arbitrary bytes never panic; every
-    command survives encoding. Disabling deduplication makes the first of
-    these fail immediately.
+    the same log must end up identical, even when one is restored from its
+    own snapshot part-way; arbitrary bytes never panic; every command
+    survives encoding. Disabling deduplication makes the first of these
+    fail immediately.
 
 - **Linearizability checker tests** (`crates/sim/src/linearizability.rs`,
   `crates/sim/src/kv_history.rs`): hand-written histories with known
@@ -104,8 +124,10 @@ raft-kv is tested at four levels:
   follower finds the leader and runs every operation, with reads through
   ReadIndex and through the log; acknowledged writes
   survive the leader being killed; the old leader restarts from its data
-  directory and catches up as a follower; a node without its data
-  directory refuses to start.
+  directory and catches up as a follower; a follower that was down while
+  the leader compacted its log catches up through `InstallSnapshot`, and
+  the whole cluster restarts from its snapshots without losing a write; a
+  node without its data directory refuses to start.
 - **Process tests** (`crates/cli/tests/cluster.rs`): five real
   `raft-kv server` processes, driven through the `raft-kv` command line.
   They elect a leader and serve every operation; the leader is killed with
@@ -145,6 +167,16 @@ Each seed also picks how many entries an `AppendEntries` may carry (1 to
 1,024). Small batches make followers catch up piece by piece, which opens
 timing windows that some bugs need.
 
+Snapshot settings vary per seed as well: nodes snapshot after every 100,
+400, 1,500 or 5,000 applied command bytes, or never; they keep 0, 1, 8 or
+64 entries behind each snapshot; and `InstallSnapshot` chunks are 16 bytes,
+128 bytes or 1 MiB. With the small settings, nodes compact every few
+entries, and a crashed follower almost always comes back to a leader that
+has compacted past it, so it catches up through a snapshot sent in many
+chunks. A restarted node recovers from its snapshot and the rest of its
+WAL. A separate test runs 20,000 ticks and checks that no node ever holds
+more than a fifth of the committed entries in its log.
+
 Five clients run a key-value workload against the cluster, the way the
 client library will:
 
@@ -183,9 +215,11 @@ Checked on every tick (log matching every 10 ticks):
   index.
 
 At the end of a run all faults are healed. After 500 fault-free ticks the
-cluster must have exactly one leader, and every node must hold the leader's
-log and have applied all of it (**liveness**). Every node's key-value state
-must then be identical. A panic inside a node also fails the run.
+cluster must have exactly one leader, and every node's log must end with the
+leader's last entry and be applied up to it (**liveness**). Logs may start
+at different points, depending on each node's last snapshot. Every node's
+key-value state, session table included, must then be identical. A panic
+inside a node also fails the run.
 
 Finally, every key is read once more, and the whole history must be
 **linearizable** (see below). The final reads turn a lost acknowledged write
@@ -231,16 +265,22 @@ time, and counts how many seeds detect each:
 
 | Injected bug | Seeds that caught it (of 1,000) | Detected as |
 |---|---|---|
-| Vote twice in one term | 934 | election safety |
+| Vote twice in one term | 906 | election safety |
 | Skip the election restriction | 999 | leader completeness |
-| Commit an older term's entry by counting replicas (Figure 8) | 9 | leader completeness |
-| Follower commits beyond what the leader's message proved | 767 | state machine safety |
-| Storage: shorten a WAL segment before removing the segments after it | 3 | recovery |
-| ReadIndex: serve reads without confirming leadership | 14 | linearizability |
-| ReadIndex: serve reads before the leader commits in its term | 592 | linearizability |
-| State machine: apply a retried request again | 967 | linearizability |
+| Commit an older term's entry by counting replicas (Figure 8) | 6 | leader completeness |
+| Follower commits beyond what the leader's message proved | 752 | panic (an internal assertion) |
+| Storage: shorten a WAL segment before removing the segments after it | 1 | recovery |
+| ReadIndex: serve reads without confirming leadership | 19 | linearizability |
+| ReadIndex: serve reads before the leader commits in its term | 536 | linearizability |
+| State machine: apply a retried request again | 978 | linearizability |
+| Snapshots: leave the session table out | 770 | state machine safety |
+| Snapshots: keep a log that conflicts with an installed snapshot | 4 | recovery |
+| Snapshots: count a follower as caught up after one chunk | 360 | liveness |
 
 Measured with `scripts/sim-mutations.sh 1000` on the default configuration.
+The counts for the older bugs moved a little when snapshots arrived: each
+seed now also draws its snapshot settings, so every seed runs a different
+schedule than before.
 
 The Figure 8 and follower-commit bugs need rare interleavings: a leader that
 crashes right after its election, and a badly delayed message. They were not
@@ -266,6 +306,14 @@ Applying a retried request twice breaks none of Raft's invariants: every
 node applies the same log in the same order. Only the linearizability check
 sees it, because clients get answers that no single execution order can
 explain.
+
+Of the snapshot bugs, leaving out the session table is caught when nodes
+compare their state machines after the run. Keeping a conflicting log
+after a snapshot needs a follower with a divergent, uncommitted suffix that
+then receives a snapshot. That is rare, and when it happens the restarted
+node's log no longer fits its snapshot. Counting a follower as caught up
+after its first chunk stops the transfer, so that follower never catches
+up.
 
 Not every bug is reachable from the simulator. Writing a `Ready`'s entries
 before its hard state can leave a node whose term is lower than its last

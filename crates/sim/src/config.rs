@@ -19,6 +19,11 @@ pub struct SimConfig {
     /// seed, from 1 to 1024, so that runs also cover followers that catch up
     /// one entry at a time.
     pub max_entries_per_append: Option<usize>,
+    /// How many command bytes a node applies before it takes a snapshot and
+    /// compacts its log. `None` picks a value per seed, from a few entries
+    /// to never, along with the log tail kept behind each snapshot and the
+    /// size of `InstallSnapshot` chunks.
+    pub snapshot_threshold: Option<u64>,
     /// Number of concurrent clients. Each has its own session and at most
     /// one request in flight.
     pub clients: usize,
@@ -152,6 +157,7 @@ impl Default for SimConfig {
             settle_ticks: 500,
             log_check_interval: 10,
             max_entries_per_append: None,
+            snapshot_threshold: None,
             clients: 5,
             keys: 3,
             request: Chance::percent(30),

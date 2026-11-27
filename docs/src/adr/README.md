@@ -12,3 +12,4 @@ accepted; a later ADR supersedes it instead.
 | [0003](0003-readindex-over-leases.md) | ReadIndex instead of leader leases | Accepted |
 | [0004](0004-session-expiry-by-leader-timestamps.md) | Expire client sessions by leader timestamps | Accepted |
 | [0005](0005-one-way-message-streams.md) | Raft messages as one-way gRPC streams | Accepted |
+| [0006](0006-persistent-maps-for-snapshots.md) | Persistent maps for snapshots, serialized off the apply loop | Accepted |

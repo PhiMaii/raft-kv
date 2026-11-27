@@ -5,10 +5,10 @@ use std::panic::{self, AssertUnwindSafe};
 
 use kv::{Command, Envelope, KvConfig, KvStore, Operation, Rejection, Response};
 use raft_core::{
-    Config, EntryPayload, Log, LogIndex, NodeId, ProposeError, Raft, ReadIndexError, ReadState,
-    Role, Term,
+    Config, EntryPayload, LogIndex, NodeId, ProposeError, Raft, ReadIndexError, ReadState, Role,
+    Term,
 };
-use storage::{SimDisk, Storage, StorageOptions};
+use storage::{SimDisk, Storage, StorageError, StorageOptions};
 
 use crate::client::{Client, InFlight, Pending, PendingRead, Request, Tag};
 use crate::config::SimConfig;
@@ -56,6 +56,8 @@ enum State {
         /// Confirmed reads waiting for the state machine to reach their
         /// index.
         confirmed_reads: Vec<(LogIndex, PendingRead)>,
+        /// Command bytes applied since the last snapshot.
+        applied_bytes: u64,
         /// The node is paused (receives and does nothing) until this tick.
         paused_until: Option<u64>,
     },
@@ -131,6 +133,9 @@ pub(crate) struct Simulation {
     last_read_id: u64,
     /// A node cut off from all others, and until which tick.
     isolated: Option<(NodeId, u64)>,
+    /// Nodes take a snapshot once they have applied this many command bytes
+    /// since the last one.
+    snapshot_threshold: u64,
 }
 
 impl Simulation {
@@ -141,6 +146,14 @@ impl Simulation {
             // which opens the timing windows several classic Raft bugs need.
             [1, 2, 4, 16, 1024][rng.index(5)]
         });
+        // Snapshot settings vary per seed: from snapshots every few entries,
+        // sent in tiny chunks with no log kept behind them, to no snapshots
+        // at all.
+        let snapshot_threshold = config
+            .snapshot_threshold
+            .unwrap_or_else(|| [100, 400, 1_500, 5_000, u64::MAX][rng.index(5)]);
+        let retained_entries = [0, 1, 8, 64][rng.index(4)];
+        let snapshot_chunk_size = [16, 128, 1 << 20][rng.index(3)];
         let ids: Vec<NodeId> = (1..=config.nodes).map(NodeId).collect();
         let nodes = ids
             .iter()
@@ -148,6 +161,8 @@ impl Simulation {
                 let peers = ids.iter().copied().filter(|&p| p != id).collect();
                 let mut raft_config = Config::new(id, peers, rng.next_u64());
                 raft_config.max_entries_per_append = max_entries_per_append;
+                raft_config.retained_entries = retained_entries;
+                raft_config.snapshot_chunk_size = snapshot_chunk_size;
                 let raft = Raft::new(raft_config.clone()).expect("valid raft config");
                 let (storage, _) =
                     Storage::open(SimDisk::new(), STORAGE).expect("empty disk opens");
@@ -161,6 +176,7 @@ impl Simulation {
                         pending: BTreeMap::new(),
                         reads: BTreeMap::new(),
                         confirmed_reads: Vec::new(),
+                        applied_bytes: 0,
                         paused_until: None,
                     },
                     observed_commit: LogIndex(0),
@@ -184,6 +200,7 @@ impl Simulation {
             history_clock: 0,
             last_read_id: 0,
             isolated: None,
+            snapshot_threshold,
             config,
         }
     }
@@ -568,6 +585,7 @@ impl Simulation {
                 pending,
                 reads,
                 confirmed_reads,
+                applied_bytes,
                 ..
             } = &mut node.state
             else {
@@ -579,36 +597,30 @@ impl Simulation {
                 storage.disk_mut().fail_after(ops);
             }
             if let Err(error) = storage.persist(&ready) {
-                if !storage.disk().has_failed() {
-                    return Err((ViolationKind::Recovery, format!("{}: {error}", node.id)));
-                }
-                let downtime = self.config.faults.downtime;
-                let restart_at = self.now + self.rng.between(downtime.0, downtime.1);
-                self.stats.write_crashes += 1;
-                self.crash(i, restart_at);
-                let id = self.nodes[i].id;
-                self.event(&format!(
-                    "{id} crashed while writing, until tick {restart_at}"
-                ));
+                let failed = storage.disk().has_failed();
+                self.crash_while_writing(i, failed, &error, "writing")?;
                 continue;
             }
 
             let id = node.id;
-            let (role, term, commit) = (raft.role(), raft.term(), raft.commit_index());
-            if role == Role::Leader {
-                self.checker.on_leader(id, term, raft.log())?;
-                if commit > node.observed_commit {
-                    let old = node.observed_commit;
-                    self.checker
-                        .on_leader_commit(id, term, old, commit, raft.log())?;
-                }
-            }
-            node.observed_commit = node.observed_commit.max(commit);
+            let (role, term) = (raft.role(), raft.term());
+            check_leader(&mut self.checker, id, raft, &mut node.observed_commit)?;
 
+            if let Some(snapshot) = &ready.snapshot {
+                **kv = KvStore::restore(KvConfig::default(), &snapshot.data).map_err(|error| {
+                    (
+                        ViolationKind::Recovery,
+                        format!("{id} received a snapshot it cannot read: {error}"),
+                    )
+                })?;
+                *applied_bytes = 0;
+                self.stats.snapshots_installed += 1;
+            }
             for entry in &ready.committed_entries {
                 self.checker.on_apply(id, entry)?;
                 let proposal = pending.remove(&entry.index);
                 if let EntryPayload::Command(bytes) = &entry.payload {
+                    *applied_bytes += bytes.len() as u64;
                     let response = kv.apply(entry.index.0, bytes);
                     // Answer only if this is the entry the node proposed; a
                     // different term means it was replaced after a leader
@@ -638,6 +650,19 @@ impl Simulation {
             if role != Role::Leader {
                 dropped.extend(std::mem::take(pending).into_values());
             }
+            if *applied_bytes >= self.snapshot_threshold {
+                *applied_bytes = 0;
+                if let Err(error) = take_snapshot(raft, storage, kv) {
+                    let failed = storage.disk().has_failed();
+                    self.crash_while_writing(i, failed, &error, "saving a snapshot")?;
+                    continue;
+                }
+                self.stats.snapshots_taken += 1;
+            }
+            self.stats.max_log_entries = self
+                .stats
+                .max_log_entries
+                .max(raft.log().entries().len() as u64);
             for message in ready.messages {
                 self.network.send(
                     self.now,
@@ -657,6 +682,30 @@ impl Simulation {
         for pending in dropped {
             self.retry_soon(pending);
         }
+        Ok(())
+    }
+
+    /// Handles a failed write on node `i`: a crash injected by the
+    /// simulator takes the node down for a while; any other storage error is
+    /// a violation.
+    fn crash_while_writing(
+        &mut self,
+        i: usize,
+        injected: bool,
+        error: &StorageError,
+        what: &str,
+    ) -> Result<(), Failure> {
+        let id = self.nodes[i].id;
+        if !injected {
+            return Err((ViolationKind::Recovery, format!("{id}: {error}")));
+        }
+        let downtime = self.config.faults.downtime;
+        let restart_at = self.now + self.rng.between(downtime.0, downtime.1);
+        self.stats.write_crashes += 1;
+        self.crash(i, restart_at);
+        self.event(&format!(
+            "{id} crashed while {what}, until tick {restart_at}"
+        ));
         Ok(())
     }
 
@@ -835,15 +884,32 @@ impl Simulation {
             node.restarts += 1;
             let mut config = node.config.clone();
             config.seed ^= node.restarts;
-            let raft = Raft::restore(config, recovered.hard_state, recovered.log)
-                .expect("valid raft config");
+            let kv = match &recovered.snapshot {
+                Some(snapshot) => {
+                    KvStore::restore(KvConfig::default(), &snapshot.data).map_err(|error| {
+                        (
+                            ViolationKind::Recovery,
+                            format!("{} cannot read its snapshot: {error}", node.id),
+                        )
+                    })?
+                }
+                None => KvStore::new(KvConfig::default()),
+            };
+            let raft = Raft::restore_with_snapshot(
+                config,
+                recovered.hard_state,
+                recovered.snapshot,
+                recovered.log,
+            )
+            .expect("valid raft config");
             node.state = State::Up {
                 raft: Box::new(raft),
                 storage: Box::new(storage),
-                kv: Box::new(KvStore::new(KvConfig::default())),
+                kv: Box::new(kv),
                 pending: BTreeMap::new(),
                 reads: BTreeMap::new(),
                 confirmed_reads: Vec::new(),
+                applied_bytes: 0,
                 paused_until: None,
             };
             node.observed_commit = LogIndex(0);
@@ -869,7 +935,7 @@ impl Simulation {
     /// Checks log matching across the running nodes. A crashed node's log
     /// is checked again once it has restarted.
     fn check_logs(&self) -> Result<(), Failure> {
-        let logs: Vec<(NodeId, &Log)> = self
+        let logs: Vec<(NodeId, &raft_core::Log)> = self
             .nodes
             .iter()
             .filter_map(|n| n.raft().map(|r| (n.id, r.log())))
@@ -878,7 +944,9 @@ impl Simulation {
     }
 
     /// After healing, exactly one leader must exist and every node must have
-    /// the leader's log and have applied all of it.
+    /// the leader's log and have applied all of it. Logs may start at
+    /// different points, depending on when each node took its last
+    /// snapshot; log matching makes equal last entries imply equal logs.
     fn check_converged(&self) -> Result<(), Failure> {
         let rafts: Vec<&Raft> = self.nodes.iter().filter_map(Node::raft).collect();
         let leaders: Vec<&&Raft> = rafts.iter().filter(|r| r.role() == Role::Leader).collect();
@@ -889,7 +957,9 @@ impl Simulation {
             ));
         };
         for raft in &rafts {
-            if raft.log() != leader.log() || raft.last_applied() != leader.log().last_index() {
+            let same_end = (raft.log().last_index(), raft.log().last_term())
+                == (leader.log().last_index(), leader.log().last_term());
+            if !same_end || raft.last_applied() != leader.log().last_index() {
                 return Err((
                     ViolationKind::Liveness,
                     format!(
@@ -978,6 +1048,38 @@ impl Simulation {
             trace: self.trace.iter().cloned().collect(),
         }
     }
+}
+
+/// Checks election safety and leader completeness if `raft` is leader, and
+/// records the entries it committed since `observed_commit`.
+fn check_leader(
+    checker: &mut Checker,
+    id: NodeId,
+    raft: &Raft,
+    observed_commit: &mut LogIndex,
+) -> Result<(), Failure> {
+    let (term, commit) = (raft.term(), raft.commit_index());
+    if raft.role() == Role::Leader {
+        checker.on_leader(id, term, raft.log())?;
+        if commit > *observed_commit {
+            checker.on_leader_commit(id, term, *observed_commit, commit, raft.log())?;
+        }
+    }
+    *observed_commit = (*observed_commit).max(commit);
+    Ok(())
+}
+
+/// Snapshots the state machine at the applied index, compacts the log and
+/// saves the snapshot.
+fn take_snapshot(
+    raft: &mut Raft,
+    storage: &mut Storage<SimDisk>,
+    kv: &KvStore,
+) -> Result<(), StorageError> {
+    let snapshot = raft
+        .compact(raft.last_applied(), kv.snapshot())
+        .expect("the applied state is newer than any snapshot");
+    storage.save_snapshot(&snapshot, raft.log().first_index())
 }
 
 /// Folds values into an FNV-1a hash.

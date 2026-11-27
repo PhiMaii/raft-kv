@@ -26,6 +26,8 @@ message RaftMessage {
     RequestVoteResponse request_vote_response = 5;
     AppendEntries append_entries = 6;
     AppendEntriesResponse append_entries_response = 7;
+    InstallSnapshot install_snapshot = 8;
+    InstallSnapshotResponse install_snapshot_response = 9;
   }
 }
 
@@ -54,6 +56,32 @@ message AppendEntriesResponse {
   optional uint64 conflict_term = 4;
   // The read_round of the AppendEntries this answers.
   uint64 read_round = 5;
+}
+
+// One chunk of the leader's snapshot, for a follower that needs entries the
+// leader has compacted. The leader sends the next chunk once the follower
+// acknowledges this one.
+message InstallSnapshot {
+  // The last entry the snapshot includes, and its term.
+  uint64 index = 1;
+  uint64 term = 2;
+  // Where this chunk starts in the snapshot, and the snapshot's size.
+  uint64 offset = 3;
+  uint64 total = 4;
+  bytes data = 5;
+  // The leader's ReadIndex confirmation round, echoed in the response.
+  uint64 read_round = 6;
+}
+
+message InstallSnapshotResponse {
+  // The index of the snapshot being transferred.
+  uint64 index = 1;
+  // How many bytes of it the follower holds: where the leader continues.
+  uint64 received = 2;
+  // Whether the follower now has everything up to index.
+  bool done = 3;
+  // The read_round of the InstallSnapshot this answers.
+  uint64 read_round = 4;
 }
 
 message Entry {

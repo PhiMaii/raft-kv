@@ -64,4 +64,35 @@ pub enum MessageBody {
         /// The `read_round` of the request this answers.
         read_round: u64,
     },
+    /// One chunk of the leader's snapshot, for a follower that needs entries
+    /// the leader has already compacted (Raft §7). The leader sends the
+    /// next chunk once the follower has acknowledged this one.
+    InstallSnapshot {
+        /// The last entry the snapshot includes.
+        index: LogIndex,
+        /// The term of that entry.
+        term: Term,
+        /// Where this chunk starts in the snapshot data.
+        offset: u64,
+        /// The snapshot's size in bytes.
+        total: u64,
+        /// The chunk.
+        data: Vec<u8>,
+        /// The leader's current ReadIndex confirmation round, as in
+        /// `AppendEntries`.
+        read_round: u64,
+    },
+    /// The answer to [`MessageBody::InstallSnapshot`].
+    InstallSnapshotResponse {
+        /// The `index` of the snapshot being transferred.
+        index: LogIndex,
+        /// How many bytes of it the follower holds: where the leader should
+        /// continue. Equals the snapshot's size once it is installed.
+        received: u64,
+        /// Whether the follower now has everything up to `index`, either
+        /// from this snapshot or because it had already committed that far.
+        done: bool,
+        /// The `read_round` of the request this answers.
+        read_round: u64,
+    },
 }

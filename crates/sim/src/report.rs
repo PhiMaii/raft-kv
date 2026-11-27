@@ -38,6 +38,13 @@ pub struct Stats {
     pub responses_lost: u64,
     /// Highest log index committed by any leader.
     pub committed_index: u64,
+    /// Snapshots nodes took of their own state machine.
+    pub snapshots_taken: u64,
+    /// Snapshots followers installed from a leader.
+    pub snapshots_installed: u64,
+    /// The most entries any node held in its in-memory log at once. With
+    /// snapshots, this stays far below the number of committed entries.
+    pub max_log_entries: u64,
 }
 
 /// A successful run.

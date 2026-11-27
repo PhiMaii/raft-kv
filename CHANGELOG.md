@@ -70,6 +70,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sim`: three in four client reads use ReadIndex, so the linearizability
   check covers both read paths. A new fault isolates the leader for 1–3
   seconds, and clients switch nodes after a timeout.
+- `raft-core`: log compaction and `InstallSnapshot` (Raft §7). `compact`
+  takes a snapshot of the state machine and keeps a configurable tail of
+  entries before it; the leader sends its snapshot in chunks, stop-and-wait,
+  to followers that need compacted entries; `Ready::snapshot` hands an
+  installed snapshot to the caller; `restore_with_snapshot` restarts a node
+  from one.
+- `storage`: an atomically replaced snapshot file. Saving a snapshot removes
+  the WAL segments before it; installing one from the leader replaces the
+  WAL, and recovery finishes a replacement that a crash interrupted.
+- `kv`: snapshots of the store, session table included. Data and sessions
+  live in persistent maps (`imbl`), so a snapshot is serialized from a
+  cheap clone (ADR 0006).
+- `server`: snapshots once `snapshot_threshold_bytes` (64 MiB) of commands
+  have been applied, serialized on a blocking thread; `retained_entries`
+  sets the log tail kept behind each snapshot.
+- `sim`: every seed picks its snapshot frequency, log tail and chunk size;
+  restarted nodes recover from their snapshot; a long-run test checks that
+  logs stay bounded; three snapshot bugs added to the mutation tests.
 - A local five-node cluster: `scripts/cluster.sh` (start, stop, kill and
   restart single nodes, status, logs, clean), `docker-compose.yml` with a
   `Dockerfile`, and example configurations in `config/`.

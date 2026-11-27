@@ -16,6 +16,8 @@ const SUFFIX: &str = ".wal";
 #[derive(Clone, Debug)]
 struct Segment {
     name: String,
+    /// The index of the segment's first entry, from its name.
+    first_index: LogIndex,
     len: u64,
 }
 
@@ -83,7 +85,11 @@ impl Wal {
                 disk.truncate(&name, len)?;
                 disk.sync(&name)?;
             }
-            wal.segments.push(Segment { name, len });
+            wal.segments.push(Segment {
+                name,
+                first_index,
+                len,
+            });
         }
         Ok((wal, entries))
     }
@@ -132,6 +138,66 @@ impl Wal {
         Ok(offset as u64)
     }
 
+    /// The index of the first stored entry, or of the next entry to append
+    /// if none is stored.
+    pub(crate) fn first_index(&self) -> LogIndex {
+        self.first_index
+    }
+
+    /// Removes every segment, durably, so that the log continues at `next`.
+    ///
+    /// Segments are removed from the last to the first, each removal synced
+    /// before the next, so a crash part-way leaves a prefix of the old log
+    /// and never a gap.
+    pub(crate) fn reset(
+        &mut self,
+        disk: &mut impl Disk,
+        next: LogIndex,
+    ) -> Result<(), StorageError> {
+        while let Some(segment) = self.segments.last() {
+            disk.remove(&segment.name)?;
+            disk.sync_dir()?;
+            self.segments.pop();
+        }
+        self.positions.clear();
+        self.first_index = next;
+        Ok(())
+    }
+
+    /// Removes the segments that hold only entries before `keep_from`,
+    /// durably. The current segment always stays.
+    ///
+    /// Segments are removed from the first onwards, each removal synced
+    /// before the next, so a crash part-way leaves a contiguous log.
+    pub(crate) fn remove_before(
+        &mut self,
+        disk: &mut impl Disk,
+        keep_from: LogIndex,
+    ) -> Result<(), StorageError> {
+        let mut removed = 0;
+        while self
+            .segments
+            .get(removed + 1)
+            .is_some_and(|next| next.first_index <= keep_from)
+        {
+            disk.remove(&self.segments[removed].name)?;
+            disk.sync_dir()?;
+            removed += 1;
+        }
+        if removed == 0 {
+            return Ok(());
+        }
+        self.segments.drain(..removed);
+        let first_index = self.segments[0].first_index;
+        let dropped = usize::try_from(first_index.0 - self.first_index.0).expect("fits in usize");
+        self.positions.drain(..dropped);
+        for position in &mut self.positions {
+            position.segment -= removed;
+        }
+        self.first_index = first_index;
+        Ok(())
+    }
+
     /// The index of the last stored entry, or the one before the first if
     /// none is stored.
     pub(crate) fn last_index(&self) -> LogIndex {
@@ -169,6 +235,7 @@ impl Wal {
                 self.flush(disk, &mut buffer)?;
                 self.segments.push(Segment {
                     name: segment_name(entry.index),
+                    first_index: entry.index,
                     len: 0,
                 });
                 dir_changed = true;

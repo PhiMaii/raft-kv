@@ -119,7 +119,7 @@ pub struct Envelope {
 
 /// Why bytes could not be decoded into an [`Envelope`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecodeError(String);
+pub struct DecodeError(pub(crate) String);
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -249,14 +249,14 @@ fn decode_operation(reader: &mut Reader<'_>) -> Result<Operation, DecodeError> {
     })
 }
 
-fn put_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+pub(crate) fn put_bytes(bytes: &[u8], out: &mut Vec<u8>) {
     let len = u32::try_from(bytes.len()).expect("field shorter than 4 GiB");
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(bytes);
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
+pub(crate) struct Reader<'a> {
+    pub(crate) bytes: &'a [u8],
 }
 
 impl Reader<'_> {
@@ -272,17 +272,17 @@ impl Reader<'_> {
         Ok(head)
     }
 
-    fn u8(&mut self) -> Result<u8, DecodeError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
     }
 
-    fn u64(&mut self) -> Result<u64, DecodeError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, DecodeError> {
         Ok(u64::from_le_bytes(
             self.take(8)?.try_into().expect("8 bytes"),
         ))
     }
 
-    fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
+    pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
         let len = u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes"));
         let len = usize::try_from(len).map_err(|_| DecodeError("length overflow".to_owned()))?;
         Ok(self.take(len)?.to_vec())

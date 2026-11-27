@@ -2,11 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::config::{Config, ConfigError};
 use crate::log::{Entry, EntryPayload, Log};
 use crate::message::{Message, MessageBody};
 use crate::rng::SplitMix64;
+use crate::snapshot::{CompactError, Snapshot};
 use crate::types::{LogIndex, NodeId, Term};
 
 /// The role a node currently plays.
@@ -35,9 +37,11 @@ pub struct HardState {
 ///
 /// The caller must handle a `Ready` in this order:
 ///
-/// 1. Make `hard_state` and `entries` durable (fsync).
+/// 1. Make `hard_state`, `snapshot` and `entries` durable (fsync), in that
+///    order.
 /// 2. Send `messages`.
-/// 3. Apply `committed_entries` to the state machine, in order.
+/// 3. If there is a `snapshot`, replace the state machine with it. Then
+///    apply `committed_entries`, in order.
 ///
 /// Persisting before sending is what makes votes and acknowledgements
 /// binding: a node that sent a vote or acked an entry and then forgot it in a
@@ -47,6 +51,11 @@ pub struct HardState {
 pub struct Ready {
     /// The new hard state, if it changed since the last `Ready`.
     pub hard_state: Option<HardState>,
+    /// A snapshot received from the leader. It replaces the whole stored
+    /// log: afterwards the stored log is this snapshot followed by
+    /// `entries`. Snapshots the node takes itself with
+    /// [`Raft::compact`] never show up here.
+    pub snapshot: Option<Snapshot>,
     /// Log entries to persist. If the first entry's index is at or below the
     /// last stored index, the stored log from that index on is replaced.
     pub entries: Vec<Entry>,
@@ -75,6 +84,7 @@ impl Ready {
     /// Whether there is nothing to persist, send or apply.
     pub fn is_empty(&self) -> bool {
         self.hard_state.is_none()
+            && self.snapshot.is_none()
             && self.entries.is_empty()
             && self.messages.is_empty()
             && self.committed_entries.is_empty()
@@ -146,6 +156,38 @@ struct Progress {
     next_index: LogIndex,
     /// The highest entry known to be replicated on the follower.
     match_index: LogIndex,
+    /// The snapshot being sent to the follower, while it needs entries the
+    /// leader has compacted.
+    transfer: Option<Transfer>,
+}
+
+/// A snapshot transfer to one follower.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Transfer {
+    /// The index of the snapshot being sent.
+    index: LogIndex,
+    /// How many bytes the follower has acknowledged: where the next chunk
+    /// starts.
+    offset: u64,
+}
+
+/// One `InstallSnapshot` chunk, unpacked from its message.
+#[derive(Debug)]
+struct Chunk {
+    index: LogIndex,
+    term: Term,
+    offset: u64,
+    total: u64,
+    data: Vec<u8>,
+}
+
+/// A snapshot a follower is receiving, chunk by chunk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Incoming {
+    index: LogIndex,
+    term: Term,
+    total: u64,
+    data: Vec<u8>,
 }
 
 /// A single Raft node.
@@ -155,6 +197,10 @@ struct Progress {
 /// - [`tick`](Self::tick) advances logical time by one tick,
 /// - [`step`](Self::step) delivers a message from another node,
 /// - [`propose`](Self::propose) submits a command on the leader,
+/// - [`read_index`](Self::read_index) starts a linearizable read on the
+///   leader,
+/// - [`compact`](Self::compact) hands over a snapshot of the state machine
+///   so that the log before it can be dropped,
 /// - [`take_ready`](Self::take_ready) collects the state to persist, the
 ///   messages to send and the entries to apply that resulted from the calls
 ///   above.
@@ -194,6 +240,12 @@ pub struct Raft {
     confirmed_round: u64,
     pending_reads: VecDeque<PendingRead>,
     read_states: Vec<ReadState>,
+    /// The latest snapshot, taken by this node or received from a leader.
+    snapshot: Option<Snapshot>,
+    /// A snapshot being received from the leader.
+    incoming: Option<Incoming>,
+    /// A snapshot installed since the last `Ready`.
+    installed: Option<Snapshot>,
 }
 
 impl Raft {
@@ -202,24 +254,55 @@ impl Raft {
         Self::restore(config, HardState::default(), Log::new())
     }
 
-    /// Creates a node from the state it persisted before a restart.
+    /// Creates a node from the state it persisted before a restart, without
+    /// a snapshot.
     ///
-    /// The commit index is not persisted. It restarts at the snapshot index
-    /// and catches up as soon as the node hears from a leader.
+    /// The commit index is not persisted. It restarts at the start of the
+    /// log and catches up as soon as the node hears from a leader.
     pub fn restore(config: Config, hard_state: HardState, log: Log) -> Result<Self, ConfigError> {
+        Self::restore_with_snapshot(config, hard_state, None, log)
+    }
+
+    /// Creates a node from the state it persisted before a restart: its hard
+    /// state, its latest snapshot and the log after the snapshot. The log
+    /// may also hold entries before the snapshot.
+    ///
+    /// The node starts with everything up to the snapshot committed and
+    /// applied; the caller restores its state machine from the snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the log does not continue the snapshot: it must start at or
+    /// before the snapshot and contain its last entry with the same term.
+    pub fn restore_with_snapshot(
+        config: Config,
+        hard_state: HardState,
+        snapshot: Option<Snapshot>,
+        log: Log,
+    ) -> Result<Self, ConfigError> {
         config.validate()?;
+        if let Some(snapshot) = &snapshot {
+            assert!(
+                log.snapshot_index() <= snapshot.index
+                    && log.term_at(snapshot.index) == Some(snapshot.term),
+                "the log does not continue the snapshot at {}",
+                snapshot.index
+            );
+        }
         // Mix the node id into the seed so that nodes configured with the same
         // seed still pick different election timeouts.
         let seed = config.seed ^ config.id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let snapshot_index = log.snapshot_index();
+        let applied = snapshot
+            .as_ref()
+            .map_or(log.snapshot_index(), |snapshot| snapshot.index);
         let mut raft = Self {
             role: Role::Follower,
             current_term: hard_state.current_term,
             voted_for: hard_state.voted_for,
             leader_id: None,
             log,
-            commit_index: snapshot_index,
-            last_applied: snapshot_index,
+            commit_index: applied,
+            last_applied: applied,
             votes: BTreeSet::new(),
             progress: BTreeMap::new(),
             election_elapsed: 0,
@@ -234,6 +317,9 @@ impl Raft {
             confirmed_round: 0,
             pending_reads: VecDeque::new(),
             read_states: Vec::new(),
+            snapshot,
+            incoming: None,
+            installed: None,
             config,
         };
         raft.reset_election_timer();
@@ -278,6 +364,11 @@ impl Raft {
     /// The highest log index handed out for applying.
     pub fn last_applied(&self) -> LogIndex {
         self.last_applied
+    }
+
+    /// The latest snapshot, taken by this node or received from a leader.
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
     }
 
     /// The node's current hard state.
@@ -372,6 +463,54 @@ impl Raft {
         Ok(())
     }
 
+    /// Records a snapshot of the state machine at `index`, taken by the
+    /// caller, and drops the log entries it makes unnecessary (Raft §7).
+    ///
+    /// `index` must be applied already. The log keeps up to
+    /// [`Config::retained_entries`] entries before `index`, and every entry
+    /// not yet handed out for persisting. The snapshot replaces the node's
+    /// previous one; the leader sends it to followers that need compacted
+    /// entries.
+    ///
+    /// Returns the snapshot, for the caller to persist. Until it is
+    /// persisted, the caller must keep the log entries it covers on disk.
+    pub fn compact(
+        &mut self,
+        index: LogIndex,
+        data: impl Into<Arc<[u8]>>,
+    ) -> Result<Snapshot, CompactError> {
+        if index > self.last_applied {
+            return Err(CompactError::NotApplied {
+                index,
+                last_applied: self.last_applied,
+            });
+        }
+        let current = self
+            .snapshot
+            .as_ref()
+            .map_or(self.log.snapshot_index(), |s| s.index)
+            .max(self.log.snapshot_index());
+        if index <= current {
+            return Err(CompactError::Outdated { index, current });
+        }
+        // Applied entries after the start of the log are always stored.
+        let Some(term) = self.log.term_at(index) else {
+            return Err(CompactError::Outdated { index, current });
+        };
+        let snapshot = Snapshot {
+            index,
+            term,
+            data: data.into(),
+        };
+        let mut start = LogIndex(index.0.saturating_sub(self.config.retained_entries));
+        if let Some(from) = self.unstable_from {
+            start = start.min(LogIndex(from.0 - 1));
+        }
+        self.log.compact_to(start);
+        self.snapshot = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
     /// Handles a message from another node.
     ///
     /// Messages addressed to another node or sent by a node outside the
@@ -382,11 +521,14 @@ impl Raft {
         }
 
         // Any message from a later term means this node is out of date
-        // (Raft §5.1). Only a leader sends AppendEntries, so its sender is the
-        // leader of that term.
+        // (Raft §5.1). Only a leader sends AppendEntries and InstallSnapshot,
+        // so their sender is the leader of that term.
         if message.term > self.current_term {
-            let leader =
-                matches!(message.body, MessageBody::AppendEntries { .. }).then_some(message.from);
+            let leader = matches!(
+                message.body,
+                MessageBody::AppendEntries { .. } | MessageBody::InstallSnapshot { .. }
+            )
+            .then_some(message.from);
             self.become_follower(message.term, leader);
         }
 
@@ -434,6 +576,32 @@ impl Raft {
                     self.handle_append_conflict(from, conflict_index, conflict_term);
                 }
             }
+            MessageBody::InstallSnapshot {
+                index,
+                term,
+                offset,
+                total,
+                data,
+                read_round,
+            } => {
+                let chunk = Chunk {
+                    index,
+                    term,
+                    offset,
+                    total,
+                    data,
+                };
+                self.handle_install_snapshot(from, &chunk, read_round);
+            }
+            MessageBody::InstallSnapshotResponse {
+                index,
+                received,
+                done,
+                read_round,
+            } => {
+                self.handle_read_ack(from, read_round);
+                self.handle_snapshot_response(from, index, received, done);
+            }
         }
     }
 
@@ -458,6 +626,7 @@ impl Raft {
 
         Ready {
             hard_state,
+            snapshot: self.installed.take(),
             entries,
             messages: std::mem::take(&mut self.outbox),
             committed_entries,
@@ -538,6 +707,7 @@ impl Raft {
                 let progress = Progress {
                     next_index,
                     match_index: LogIndex(0),
+                    transfer: None,
                 };
                 (peer, progress)
             })
@@ -577,15 +747,17 @@ impl Raft {
     }
 
     fn send_append(&mut self, peer: NodeId) {
-        let Some(progress) = self.progress.get(&peer) else {
+        let Some(progress) = self.progress.get_mut(&peer) else {
             return;
         };
         let prev_log_index = LogIndex(progress.next_index.0 - 1);
         let Some(prev_log_term) = self.log.term_at(prev_log_index) else {
-            // The entries the follower needs were compacted into a snapshot.
-            // Sending the snapshot (InstallSnapshot) comes with log compaction.
+            // The entries the follower needs were compacted into the
+            // snapshot.
+            self.send_snapshot(peer);
             return;
         };
+        progress.transfer = None;
         let entries: Vec<Entry> = self
             .log
             .entries_from(progress.next_index)
@@ -801,6 +973,181 @@ impl Raft {
         self.send_append(peer);
     }
 
+    /// Sends `peer` the next chunk of the leader's snapshot.
+    ///
+    /// The transfer is stop-and-wait: the next chunk goes out when the
+    /// follower acknowledges this one, and heartbeats resend the current
+    /// chunk in case it was lost.
+    fn send_snapshot(&mut self, peer: NodeId) {
+        let Some(snapshot) = self.snapshot.clone() else {
+            // Only a log restored without its snapshot can start after index
+            // 0 with no snapshot; nothing can be sent then.
+            return;
+        };
+        let Some(progress) = self.progress.get_mut(&peer) else {
+            return;
+        };
+        let offset = match progress.transfer {
+            Some(transfer) if transfer.index == snapshot.index => transfer.offset,
+            // A new transfer, or a newer snapshot than the one being sent.
+            _ => 0,
+        };
+        progress.transfer = Some(Transfer {
+            index: snapshot.index,
+            offset,
+        });
+        let len = snapshot.data.len();
+        let start = usize::try_from(offset).map_or(len, |offset| offset.min(len));
+        let end = start
+            .saturating_add(self.config.snapshot_chunk_size)
+            .min(len);
+        self.send(
+            peer,
+            MessageBody::InstallSnapshot {
+                index: snapshot.index,
+                term: snapshot.term,
+                offset: start as u64,
+                total: len as u64,
+                data: snapshot.data[start..end].to_vec(),
+                read_round: self.read_round,
+            },
+        );
+    }
+
+    /// Follower side of `InstallSnapshot` (Raft §7): collects the chunks and
+    /// installs the snapshot once all have arrived.
+    fn handle_install_snapshot(&mut self, leader: NodeId, chunk: &Chunk, read_round: u64) {
+        match self.role {
+            Role::Candidate => self.become_follower(self.current_term, Some(leader)),
+            Role::Follower => {
+                self.leader_id = Some(leader);
+                self.reset_election_timer();
+            }
+            Role::Leader => return,
+        }
+        let respond = |raft: &mut Self, received: u64, done: bool| {
+            raft.send(
+                leader,
+                MessageBody::InstallSnapshotResponse {
+                    index: chunk.index,
+                    received,
+                    done,
+                    read_round,
+                },
+            );
+        };
+
+        if chunk.index <= self.commit_index {
+            // Everything up to the snapshot is committed here already, so
+            // it matches the leader's log.
+            respond(self, chunk.total, true);
+            return;
+        }
+        let same_snapshot = self
+            .incoming
+            .as_ref()
+            .is_some_and(|incoming| (incoming.index, incoming.term) == (chunk.index, chunk.term));
+        if !same_snapshot {
+            if chunk.offset != 0 {
+                // A chunk from the middle of a snapshot we have not started:
+                // ask for the beginning.
+                respond(self, 0, false);
+                return;
+            }
+            self.incoming = Some(Incoming {
+                index: chunk.index,
+                term: chunk.term,
+                total: chunk.total,
+                data: Vec::new(),
+            });
+        }
+        let incoming = self.incoming.as_mut().expect("set above");
+        // Chunks may arrive twice or out of order; take only the one that
+        // continues what we have.
+        if chunk.offset == incoming.data.len() as u64 {
+            incoming.data.extend_from_slice(&chunk.data);
+        }
+        let received = incoming.data.len() as u64;
+        if received < incoming.total {
+            respond(self, received, false);
+            return;
+        }
+        let incoming = self.incoming.take().expect("set above");
+        if received > incoming.total {
+            // The chunks do not add up to the announced size; start over.
+            respond(self, 0, false);
+            return;
+        }
+        self.install_snapshot(Snapshot {
+            index: incoming.index,
+            term: incoming.term,
+            data: incoming.data.into(),
+        });
+        respond(self, received, true);
+    }
+
+    /// Replaces the log up to the snapshot's index with the snapshot. Entries
+    /// after it are kept if the log has the snapshot's last entry; otherwise
+    /// the whole log is discarded (Raft §7).
+    fn install_snapshot(&mut self, snapshot: Snapshot) {
+        if self.log.term_at(snapshot.index) == Some(snapshot.term) {
+            self.log.compact_to(snapshot.index);
+        } else {
+            self.log = Log::from_parts(snapshot.index, snapshot.term, Vec::new())
+                .expect("an empty log is valid");
+        }
+        self.commit_index = self.commit_index.max(snapshot.index);
+        self.last_applied = snapshot.index;
+        // Storage replaces its whole log with the snapshot, so every entry
+        // kept after it must be written again.
+        self.unstable_from = Some(snapshot.index.next());
+        self.snapshot = Some(snapshot.clone());
+        self.installed = Some(snapshot);
+    }
+
+    /// Leader side of `InstallSnapshot`: continues or finishes a transfer.
+    fn handle_snapshot_response(
+        &mut self,
+        peer: NodeId,
+        index: LogIndex,
+        received: u64,
+        done: bool,
+    ) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let last_index = self.log.last_index();
+        let Some(progress) = self.progress.get_mut(&peer) else {
+            return;
+        };
+        if done {
+            progress.match_index = progress.match_index.max(index);
+            progress.next_index = progress.next_index.max(progress.match_index.next());
+            progress.transfer = None;
+            let behind = progress.next_index <= last_index;
+            self.maybe_commit();
+            if behind {
+                self.send_append(peer);
+            }
+            return;
+        }
+        let Some(transfer) = &mut progress.transfer else {
+            return;
+        };
+        if transfer.index != index {
+            return;
+        }
+        // Continue only on progress. Answers to duplicated or resent chunks
+        // would otherwise each start another chain of chunks. If the
+        // follower has less than we thought, the next heartbeat resends from
+        // there.
+        let progressed = received > transfer.offset;
+        transfer.offset = received;
+        if progressed {
+            self.send_snapshot(peer);
+        }
+    }
+
     /// Advances the commit index to the highest entry stored on a majority,
     /// if that entry is from the current term (Raft §5.4.2).
     fn maybe_commit(&mut self) {
@@ -893,9 +1240,17 @@ impl Raft {
                 conflict_term: None,
                 read_round,
             },
-            MessageBody::RequestVoteResponse { .. } | MessageBody::AppendEntriesResponse { .. } => {
-                return
-            }
+            MessageBody::InstallSnapshot {
+                index, read_round, ..
+            } => MessageBody::InstallSnapshotResponse {
+                index,
+                received: 0,
+                done: false,
+                read_round,
+            },
+            MessageBody::RequestVoteResponse { .. }
+            | MessageBody::AppendEntriesResponse { .. }
+            | MessageBody::InstallSnapshotResponse { .. } => return,
         };
         self.send(message.from, body);
     }

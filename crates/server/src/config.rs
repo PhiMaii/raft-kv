@@ -49,6 +49,15 @@ pub struct ServerConfig {
     /// How reads are made linearizable.
     #[serde(default)]
     pub read_mode: ReadMode,
+    /// How many bytes of commands the node applies before it snapshots its
+    /// state machine and compacts its log.
+    #[serde(default = "default_snapshot_threshold_bytes")]
+    pub snapshot_threshold_bytes: u64,
+    /// How many log entries before a snapshot to keep, so that followers
+    /// that are only slightly behind catch up from the log rather than
+    /// receiving the whole snapshot.
+    #[serde(default = "default_retained_entries")]
+    pub retained_entries: u64,
 }
 
 /// How the leader serves linearizable reads.
@@ -80,6 +89,14 @@ fn default_tick_ms() -> u64 {
 
 fn default_request_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_snapshot_threshold_bytes() -> u64 {
+    64 << 20
+}
+
+fn default_retained_entries() -> u64 {
+    1024
 }
 
 /// Why a configuration could not be used.
@@ -132,6 +149,9 @@ impl ServerConfig {
         if self.request_timeout_ms == 0 {
             return invalid("request_timeout_ms must be positive");
         }
+        if self.snapshot_threshold_bytes == 0 {
+            return invalid("snapshot_threshold_bytes must be positive");
+        }
         Ok(())
     }
 
@@ -179,6 +199,8 @@ mod tests {
         assert_eq!(config.tick(), Duration::from_millis(10));
         assert_eq!(config.request_timeout(), Duration::from_secs(5));
         assert_eq!(config.read_mode, ReadMode::ReadIndex);
+        assert_eq!(config.snapshot_threshold_bytes, 64 << 20);
+        assert_eq!(config.retained_entries, 1024);
         let log_reads: ServerConfig =
             toml::from_str(&format!("read_mode = \"log\"\n{VALID}")).expect("valid");
         assert_eq!(log_reads.read_mode, ReadMode::Log);
