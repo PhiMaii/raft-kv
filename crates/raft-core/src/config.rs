@@ -25,6 +25,16 @@ pub struct Config {
     /// The most entries a single `AppendEntries` message may carry, so a
     /// follower that is far behind catches up in bounded steps.
     pub max_entries_per_append: usize,
+    /// About how many bytes of entries a single `AppendEntries` may carry.
+    /// An entry larger than this still goes out, alone.
+    pub max_append_bytes: usize,
+    /// Whether to batch replication: while an `AppendEntries` with entries
+    /// is waiting for its answer, new entries for that follower wait too,
+    /// and go out together when the answer arrives. A leader that is not
+    /// waiting sends at once, so batching adds no latency when idle. Off,
+    /// every proposal sends every follower all entries it has not
+    /// acknowledged yet.
+    pub batch_appends: bool,
     /// The most snapshot bytes a single `InstallSnapshot` message may carry.
     pub snapshot_chunk_size: usize,
     /// How many entries before a snapshot to keep in the log when it is
@@ -48,6 +58,8 @@ impl Config {
             election_timeout_max: 30,
             heartbeat_interval: 5,
             max_entries_per_append: 1024,
+            max_append_bytes: 1 << 20,
+            batch_appends: true,
             snapshot_chunk_size: 1 << 20,
             retained_entries: 1024,
             seed,
@@ -75,6 +87,9 @@ impl Config {
         if self.max_entries_per_append == 0 {
             return Err(ConfigError::ZeroMaxEntriesPerAppend);
         }
+        if self.max_append_bytes == 0 {
+            return Err(ConfigError::ZeroMaxAppendBytes);
+        }
         if self.snapshot_chunk_size == 0 {
             return Err(ConfigError::ZeroSnapshotChunkSize);
         }
@@ -99,6 +114,8 @@ pub enum ConfigError {
     ZeroMaxEntriesPerAppend,
     /// `snapshot_chunk_size` is zero.
     ZeroSnapshotChunkSize,
+    /// `max_append_bytes` is zero.
+    ZeroMaxAppendBytes,
 }
 
 impl fmt::Display for ConfigError {
@@ -115,6 +132,7 @@ impl fmt::Display for ConfigError {
             }
             Self::ZeroMaxEntriesPerAppend => "max entries per append must be at least one",
             Self::ZeroSnapshotChunkSize => "snapshot chunk size must be at least one byte",
+            Self::ZeroMaxAppendBytes => "max append bytes must be at least one byte",
         };
         f.write_str(message)
     }
@@ -162,6 +180,10 @@ mod tests {
         let mut c = base.clone();
         c.max_entries_per_append = 0;
         assert_eq!(c.validate(), Err(ConfigError::ZeroMaxEntriesPerAppend));
+
+        let mut c = base.clone();
+        c.max_append_bytes = 0;
+        assert_eq!(c.validate(), Err(ConfigError::ZeroMaxAppendBytes));
 
         let mut c = base;
         c.snapshot_chunk_size = 0;

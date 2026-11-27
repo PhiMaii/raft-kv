@@ -212,9 +212,14 @@ fn leader_appends_a_proposal_and_sends_it_to_every_follower() {
     let ready = raft.take_ready();
     assert_eq!(ready.entries.len(), 1);
     assert_eq!(ready.entries[0].payload, EntryPayload::Command(vec![42]));
-    // The followers have not acknowledged the no-op yet, so it is resent.
-    assert_eq!(appends_to(&ready.messages, N2), vec![(0, vec![1, 2])]);
-    assert_eq!(appends_to(&ready.messages, N3), vec![(0, vec![1, 2])]);
+    // The no-op is still waiting for its answers, so the proposal waits
+    // too (see tests/batching.rs) and goes out once a follower answers.
+    assert_eq!(appends_to(&ready.messages, N2), vec![]);
+    let term = raft.term();
+    raft.step(success(N2, term, 1));
+    let ready = raft.take_ready();
+    assert_eq!(appends_to(&ready.messages, N2), vec![(1, vec![2])]);
+    assert_eq!(appends_to(&ready.messages, N3), vec![]);
 }
 
 #[test]

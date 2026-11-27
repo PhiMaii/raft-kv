@@ -17,6 +17,29 @@ pub struct Message {
     pub body: MessageBody,
 }
 
+impl Message {
+    /// Whether the message may be sent before the [`Ready`](crate::Ready)
+    /// that produced it is persisted (Raft dissertation §10.2.1).
+    ///
+    /// True for `AppendEntries` and `InstallSnapshot`. Only a leader sends
+    /// them, and they carry its own log; they promise nothing about what is
+    /// on its disk. The leader counts its own entries towards a majority
+    /// only when it handles a follower's answer, and that happens after the
+    /// caller has finished persisting. Votes and every answer, in contrast,
+    /// promise state that must be durable first.
+    ///
+    /// Sending these early lets the leader's fsync overlap with the network
+    /// round trip. It is only safe if the caller finishes persisting before
+    /// its next call into `Raft`.
+    #[must_use]
+    pub fn may_send_before_persisting(&self) -> bool {
+        matches!(
+            self.body,
+            MessageBody::AppendEntries { .. } | MessageBody::InstallSnapshot { .. }
+        )
+    }
+}
+
 /// The RPC carried by a [`Message`] (Raft §5, Figure 2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MessageBody {

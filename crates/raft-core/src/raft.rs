@@ -46,6 +46,11 @@ pub struct HardState {
 /// Persisting before sending is what makes votes and acknowledgements
 /// binding: a node that sent a vote or acked an entry and then forgot it in a
 /// crash could vote twice in one term or lose a committed entry.
+///
+/// The one exception: messages for which
+/// [`Message::may_send_before_persisting`] holds (a leader's replication
+/// messages) may be sent before step 1, so that the leader's fsync overlaps
+/// with the round trip to its followers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[must_use = "a Ready holds state to persist, messages to send and entries to apply"]
 pub struct Ready {
@@ -159,6 +164,9 @@ struct Progress {
     /// The snapshot being sent to the follower, while it needs entries the
     /// leader has compacted.
     transfer: Option<Transfer>,
+    /// Whether an `AppendEntries` with entries is waiting for its answer.
+    /// With batching, new entries wait for it instead of going out at once.
+    in_flight: bool,
 }
 
 /// A snapshot transfer to one follower.
@@ -169,6 +177,16 @@ struct Transfer {
     /// How many bytes the follower has acknowledged: where the next chunk
     /// starts.
     offset: u64,
+}
+
+/// The size of an entry for `max_append_bytes`: its command, plus a little
+/// for index, term and framing, so that no-ops count too.
+fn entry_size(entry: &Entry) -> usize {
+    let command = match &entry.payload {
+        EntryPayload::Noop => 0,
+        EntryPayload::Command(bytes) => bytes.len(),
+    };
+    command + 24
 }
 
 /// One `InstallSnapshot` chunk, unpacked from its message.
@@ -411,6 +429,11 @@ impl Raft {
     /// committed once an entry at that index **with the current term** shows
     /// up in [`Ready::committed_entries`]. If a different entry is committed
     /// at that index, leadership was lost and the command was dropped.
+    ///
+    /// With [`Config::batch_appends`], the entry goes out at once only to
+    /// followers that have no `AppendEntries` waiting for an answer. For the
+    /// others it waits, together with every entry proposed meanwhile, and
+    /// goes out in one message when the answer arrives.
     pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, ProposeError> {
         if self.role != Role::Leader {
             return Err(ProposeError::NotLeader {
@@ -418,7 +441,12 @@ impl Raft {
             });
         }
         let index = self.append_as_leader(EntryPayload::Command(command));
-        self.broadcast_append();
+        for peer in self.config.peers.clone() {
+            let busy = self.progress.get(&peer).is_some_and(|p| p.in_flight);
+            if !(self.config.batch_appends && busy) {
+                self.send_append(peer);
+            }
+        }
         Ok(index)
     }
 
@@ -570,6 +598,9 @@ impl Raft {
                 // Any answer in our term, even a failed consistency check,
                 // shows the follower still accepts us as leader.
                 self.handle_read_ack(from, read_round);
+                if let Some(progress) = self.progress.get_mut(&from) {
+                    progress.in_flight = false;
+                }
                 if success {
                     self.handle_append_success(from, match_index);
                 } else {
@@ -708,6 +739,7 @@ impl Raft {
                     next_index,
                     match_index: LogIndex(0),
                     transfer: None,
+                    in_flight: false,
                 };
                 (peer, progress)
             })
@@ -758,13 +790,22 @@ impl Raft {
             return;
         };
         progress.transfer = None;
+        // At most `max_entries_per_append` entries and about
+        // `max_append_bytes` of commands, but always at least one entry.
+        let mut bytes = 0;
         let entries: Vec<Entry> = self
             .log
             .entries_from(progress.next_index)
             .iter()
             .take(self.config.max_entries_per_append)
+            .take_while(|entry| {
+                let first = bytes == 0;
+                bytes += entry_size(entry);
+                first || bytes <= self.config.max_append_bytes
+            })
             .cloned()
             .collect();
+        progress.in_flight |= !entries.is_empty();
         self.send(
             peer,
             MessageBody::AppendEntries {
