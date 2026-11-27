@@ -90,10 +90,10 @@ struct BenchArgs {
     #[arg(long, default_value_t = 32)]
     clients: usize,
     /// Seconds to measure, after the warm-up.
-    #[arg(long, default_value_t = 20.0)]
+    #[arg(long, env = "RAFT_KV_BENCH_DURATION", default_value_t = 20.0)]
     duration: f64,
     /// Seconds to run before measuring.
-    #[arg(long, default_value_t = 5.0)]
+    #[arg(long, env = "RAFT_KV_BENCH_WARMUP", default_value_t = 5.0)]
     warmup: f64,
     /// Percentage of operations that are reads; the rest are writes.
     #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u8).range(0..=100))]
