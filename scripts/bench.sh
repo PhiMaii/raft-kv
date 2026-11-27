@@ -8,12 +8,19 @@
 #       given options (see `raft-kv bench --help`), writes the report to
 #       bench/results/NAME.local.json (git-ignored) and stops the cluster.
 #   scripts/bench.sh matrix
-#       Runs every scenario listed in this script and writes the reports to
-#       bench/results/NAME.json. These are the numbers in
-#       docs/src/benchmarks.md.
+#       Runs every scenario listed in this script once and writes the
+#       reports to bench/results/NAME.json.
+#   scripts/bench.sh record LABEL
+#       Runs every scenario three times and appends, per scenario, the run
+#       with the median throughput to bench/history/MACHINE.jsonl, with the
+#       commit, the machine, the power source and an fsync calibration.
+#       LABEL names the milestone or release measured. Run once per merged
+#       milestone, from a clean checkout, on mains power.
 #
 # Environment: NODES (default 3) sets the cluster size; BASE_PORT (default
-# 7200) the first port, node i listens on BASE_PORT + i.
+# 7200) the first port, node i listens on BASE_PORT + i; ALLOW_BATTERY=1
+# lets `record` run on battery power; RAFT_KV_BENCH_DURATION and
+# RAFT_KV_BENCH_WARMUP (seconds) shorten the runs, for trying the script.
 #
 # Every node runs on this machine with its data in a temporary directory,
 # so all nodes share one CPU and one disk, and fsync is real.
@@ -28,6 +35,7 @@ RESULTS="bench/results"
 
 PIDS=()
 WORKDIR=""
+RUNS=""
 
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
@@ -40,7 +48,7 @@ cleanup() {
   [[ -n "$WORKDIR" ]] && rm -rf "$WORKDIR"
   WORKDIR=""
 }
-trap cleanup EXIT
+trap 'cleanup; [[ -n "$RUNS" ]] && rm -rf "$RUNS"' EXIT
 
 address() { echo "127.0.0.1:$((BASE_PORT + $1))"; }
 
@@ -107,7 +115,12 @@ run() {
   done
   [[ $# -gt 0 ]] && shift
   options=("$@")
-  echo "== $name: ${settings[*]:-defaults} ${options[*]:-}"
+  echo "== $name ($NODES nodes): ${settings[*]:-defaults} ${options[*]:-}"
+  # What the history needs to know about the scenario besides the report.
+  python3 -I -c 'import json, sys
+print(json.dumps({"nodes": int(sys.argv[1]),
+                  "settings": dict(s.split("=", 1) for s in sys.argv[2:])}))' \
+    "$NODES" "${settings[@]:+${settings[@]}}" >"${output%.json}.setup"
   start_cluster "${settings[@]:+${settings[@]}}"
   RAFT_KV_CLUSTER="$(cluster_addresses)" "$BIN" bench "${options[@]:+${options[@]}}" \
     --output "$output"
@@ -120,6 +133,54 @@ build() {
   mkdir -p "$RESULTS"
 }
 
+# scenarios DIR SUFFIX: runs every scenario once, writing DIR/NAME$SUFFIX.json.
+# Defaults: 32 clients, 1,000 keys, 100-byte values, 5 s warm-up and 20 s
+# measured, batching and early sends on, ReadIndex reads.
+scenarios() {
+  local dir="$1" suffix="$2"
+  run mixed "$dir/mixed$suffix.json" -- --reads 50
+  run writes "$dir/writes$suffix.json" -- --reads 0
+  run reads "$dir/reads$suffix.json" -- --reads 95
+  run writes-unbatched "$dir/writes-unbatched$suffix.json" batch_appends=false -- --reads 0
+  run writes-persist-first "$dir/writes-persist-first$suffix.json" send_before_persist=false -- --reads 0
+  run reads-through-log "$dir/reads-through-log$suffix.json" read_mode=log -- --reads 95
+  run single-client "$dir/single-client$suffix.json" -- --reads 50 --clients 1
+  run writes-128-clients "$dir/writes-128-clients$suffix.json" -- --reads 0 --clients 128
+  NODES=5 run writes-5-nodes "$dir/writes-5-nodes$suffix.json" -- --reads 0
+}
+
+# Prints "ac", "battery" or "unknown".
+power_source() {
+  if command -v pmset >/dev/null; then
+    case "$(pmset -g batt | head -1)" in
+      *"AC Power"*) echo ac ;;
+      *"Battery Power"*) echo battery ;;
+      *) echo unknown ;;
+    esac
+    return
+  fi
+  local supply
+  for supply in /sys/class/power_supply/*; do
+    if [[ "$(cat "$supply/type" 2>/dev/null)" == Mains ]]; then
+      [[ "$(cat "$supply/online" 2>/dev/null)" == 1 ]] && echo ac || echo battery
+      return
+    fi
+  done
+  echo unknown
+}
+
+# Refuses to measure on battery power: laptops throttle then.
+check_power() {
+  local power
+  power="$(power_source)"
+  if [[ "$power" == battery && "${ALLOW_BATTERY:-}" != 1 ]]; then
+    echo "error: running on battery; plug in, or set ALLOW_BATTERY=1" >&2
+    exit 1
+  fi
+  [[ "$power" == unknown ]] && echo "warning: cannot tell the power source" >&2
+  echo "$power"
+}
+
 case "${1:-}" in
   run)
     [[ $# -ge 2 ]] || { echo "usage: $0 run NAME [setting=value ...] [-- options]" >&2; exit 1; }
@@ -127,23 +188,46 @@ case "${1:-}" in
     name="$2"
     shift 2
     run "$name" "$RESULTS/$name.local.json" "$@"
+    rm -f "$RESULTS/$name.local.setup"
     ;;
   matrix)
     build
-    # Defaults: 32 clients, 1,000 keys, 100-byte values, 5 s warm-up and
-    # 20 s measured, batching and early sends on, ReadIndex reads.
-    run mixed "$RESULTS/mixed.json" -- --reads 50
-    run writes "$RESULTS/writes.json" -- --reads 0
-    run reads "$RESULTS/reads.json" -- --reads 95
-    run writes-unbatched "$RESULTS/writes-unbatched.json" batch_appends=false -- --reads 0
-    run writes-persist-first "$RESULTS/writes-persist-first.json" send_before_persist=false -- --reads 0
-    run reads-through-log "$RESULTS/reads-through-log.json" read_mode=log -- --reads 95
-    run single-client "$RESULTS/single-client.json" -- --reads 50 --clients 1
-    run writes-128-clients "$RESULTS/writes-128-clients.json" -- --reads 0 --clients 128
-    NODES=5 run writes-5-nodes "$RESULTS/writes-5-nodes.json" -- --reads 0
+    scenarios "$RESULTS" ""
+    rm -f "$RESULTS"/*.setup
+    ;;
+  record)
+    [[ $# -ge 2 ]] || { echo "usage: $0 record LABEL" >&2; exit 1; }
+    label="$2"
+    if [[ -n "$(git status --porcelain)" ]]; then
+      echo "error: uncommitted changes; a record must belong to a commit" >&2
+      exit 1
+    fi
+    power="$(check_power)"
+    build
+    RUNS="$(mktemp -d)"
+    echo "== fsync calibration"
+    one="$(python3 -I scripts/fsync-probe.py --json --processes 1)"
+    three="$(python3 -I scripts/fsync-probe.py --json --processes 3)"
+    python3 -I -c 'import json, sys
+print(json.dumps({"one_process": json.loads(sys.argv[1]),
+                  "three_processes": json.loads(sys.argv[2])}))' "$one" "$three" \
+      >"$RUNS/fsync.json"
+    cat "$RUNS/fsync.json"
+    # Whole rounds rather than three runs in a row, so that a slow drift
+    # (heat, background work) spreads over all scenarios alike.
+    for round in 1 2 3; do
+      [[ "$(check_power)" == "$power" ]] || { echo "error: power source changed" >&2; exit 1; }
+      scenarios "$RUNS" ".run$round"
+    done
+    for setup in "$RUNS"/*.run1.setup; do
+      name="$(basename "$setup" .run1.setup)"
+      mv "$setup" "$RUNS/$name.scenario.json"
+    done
+    rm -f "$RUNS"/*.setup
+    python3 -I scripts/bench-record.py "$RUNS" bench/history "$label" "$power"
     ;;
   *)
-    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

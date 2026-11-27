@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measures how long it takes to make a small append durable.
 
-Usage: scripts/fsync-probe.py [--processes N] [--iterations N] [--dir DIR]
+Usage: scripts/fsync-probe.py [--processes N] [--iterations N] [--dir DIR] [--json]
 
 Each process appends 200 bytes to a file of its own and syncs it, over and
 over, the way a node syncs its WAL. On macOS the sync is F_FULLFSYNC, which
@@ -11,6 +11,7 @@ several processes at once shows what nodes sharing one disk pay.
 
 import argparse
 import fcntl
+import json
 import multiprocessing
 import os
 import statistics
@@ -41,6 +42,7 @@ def main():
     parser.add_argument("--processes", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=300)
     parser.add_argument("--dir", help="where to write; default: a temporary directory")
+    parser.add_argument("--json", action="store_true", help="print the result as JSON")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(dir=args.dir) as directory:
@@ -59,10 +61,18 @@ def main():
             worker.join()
 
     sync = "F_FULLFSYNC" if hasattr(fcntl, "F_FULLFSYNC") else "fsync"
-    print(
-        f"{args.processes} process(es), {sync}: median {statistics.median(times):.2f} ms, "
-        f"p99 {times[int(len(times) * 0.99)]:.2f} ms"
-    )
+    median = statistics.median(times)
+    p99 = times[int(len(times) * 0.99)]
+    if args.json:
+        result = {
+            "processes": args.processes,
+            "sync": sync,
+            "median_ms": round(median, 3),
+            "p99_ms": round(p99, 3),
+        }
+        print(json.dumps(result))
+    else:
+        print(f"{args.processes} process(es), {sync}: median {median:.2f} ms, p99 {p99:.2f} ms")
 
 
 if __name__ == "__main__":
