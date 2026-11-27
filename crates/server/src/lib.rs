@@ -14,6 +14,10 @@
 //!    clients get their answers.
 //!
 //! Everything taken from the channels in one round shares one fsync.
+//!
+//! Once enough commands have been applied, the node snapshots the key-value
+//! store on a blocking thread, from a cheap clone, and then compacts its log
+//! (see `raft_core::Raft::compact`).
 
 mod config;
 mod handler;
@@ -138,14 +142,33 @@ pub async fn start(config: ServerConfig, data_dir: DataDir) -> Result<Server, St
     info!(
         node = id.0,
         term = recovered.hard_state.current_term.0,
+        snapshot = recovered.snapshot.as_ref().map_or(0, |s| s.index.0),
         last_index = recovered.log.last_index().0,
         "recovered stored state"
     );
+    let kv = match &recovered.snapshot {
+        Some(snapshot) => {
+            KvStore::restore(KvConfig::default(), &snapshot.data).map_err(|error| {
+                StartError::Storage(StorageError::Corrupt {
+                    file: "snapshot".to_owned(),
+                    offset: 0,
+                    reason: error.to_string(),
+                })
+            })?
+        }
+        None => KvStore::new(KvConfig::default()),
+    };
 
     let peer_ids = config.peers.iter().map(|peer| NodeId(peer.id)).collect();
-    let raft_config = Config::new(id, peer_ids, seed(id));
-    let raft = Raft::restore(raft_config, recovered.hard_state, recovered.log)
-        .map_err(|error| StartError::Config(ConfigError::Invalid(error.to_string())))?;
+    let mut raft_config = Config::new(id, peer_ids, seed(id));
+    raft_config.retained_entries = config.retained_entries;
+    let raft = Raft::restore_with_snapshot(
+        raft_config,
+        recovered.hard_state,
+        recovered.snapshot,
+        recovered.log,
+    )
+    .map_err(|error| StartError::Config(ConfigError::Invalid(error.to_string())))?;
 
     let mut peers = BTreeMap::new();
     let mut addresses = BTreeMap::new();
@@ -173,13 +196,8 @@ pub async fn start(config: ServerConfig, data_dir: DataDir) -> Result<Server, St
         .add_service(KvService::new(Arc::new(handler)).into_server())
         .serve_with_incoming(TcpListenerStream::new(listener));
 
-    let node = Node::new(
-        raft,
-        storage,
-        KvStore::new(KvConfig::default()),
-        peers,
-        addresses,
-    );
+    let node = Node::new(raft, storage, kv, peers, addresses)
+        .with_snapshot_threshold(config.snapshot_threshold_bytes);
     let span = tracing::info_span!("node", id = id.0);
     let node = tokio::spawn(
         node.run(inbox_receiver, request_receiver, config.tick())
