@@ -84,6 +84,8 @@ pub(crate) struct Node {
     snapshot_threshold: u64,
     /// Whether a snapshot is being serialized.
     snapshotting: bool,
+    /// Whether to send a leader's replication messages before persisting.
+    send_before_persist: bool,
     /// Where serialized snapshots arrive: the index they were taken at and
     /// their data.
     snapshots: mpsc::Sender<(LogIndex, Vec<u8>)>,
@@ -114,6 +116,7 @@ impl Node {
             applied_bytes: 0,
             snapshot_threshold: u64::MAX,
             snapshotting: false,
+            send_before_persist: false,
             snapshots,
             finished_snapshots: Some(finished_snapshots),
         }
@@ -123,6 +126,14 @@ impl Node {
     /// since the last one. Without this, the node never takes one.
     pub(crate) fn with_snapshot_threshold(mut self, bytes: u64) -> Self {
         self.snapshot_threshold = bytes;
+        self
+    }
+
+    /// Sends a leader's replication messages before persisting each round
+    /// (see `raft_core::Message::may_send_before_persisting`). Safe because
+    /// the loop finishes persisting before it hands Raft anything else.
+    pub(crate) fn with_send_before_persist(mut self, enabled: bool) -> Self {
+        self.send_before_persist = enabled;
         self
     }
 
@@ -220,18 +231,19 @@ impl Node {
     /// Persists, sends and applies what the last round produced, in the
     /// order [`raft_core::Ready`] prescribes.
     fn process_ready(&mut self) -> Result<(), StorageError> {
-        let ready = self.raft.take_ready();
+        let mut ready = self.raft.take_ready();
         if !ready.is_empty() {
+            if self.send_before_persist {
+                let (early, late) = std::mem::take(&mut ready.messages)
+                    .into_iter()
+                    .partition(Message::may_send_before_persisting);
+                ready.messages = late;
+                self.send(early);
+            }
             // fsync blocks; tell the runtime so it can move other tasks to
             // another thread meanwhile.
             tokio::task::block_in_place(|| self.storage.persist(&ready))?;
-            for message in ready.messages {
-                if let Some(peer) = self.peers.get(&message.to) {
-                    if !peer.send(message) {
-                        debug!(peer = %peer.id(), "send queue full; message dropped");
-                    }
-                }
-            }
+            self.send(std::mem::take(&mut ready.messages));
             if let Some(snapshot) = &ready.snapshot {
                 self.kv = KvStore::restore(*self.kv.config(), &snapshot.data).map_err(|error| {
                     StorageError::Corrupt {
@@ -312,6 +324,18 @@ impl Node {
             Err(error) => warn!(%error, "snapshot discarded"),
         }
         Ok(())
+    }
+
+    /// Queues messages for their peers. A peer's queue only fills up while
+    /// it is unreachable; Raft resends what is lost.
+    fn send(&self, messages: Vec<Message>) {
+        for message in messages {
+            if let Some(peer) = self.peers.get(&message.to) {
+                if !peer.send(message) {
+                    debug!(peer = %peer.id(), "send queue full; message dropped");
+                }
+            }
+        }
     }
 
     /// Answers confirmed reads whose index the state machine has reached.

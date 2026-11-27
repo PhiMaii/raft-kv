@@ -103,6 +103,9 @@ impl Cluster {
                     read_mode: ReadMode::ReadIndex,
                     snapshot_threshold_bytes: 64 << 20,
                     retained_entries: 1024,
+                    batch_appends: true,
+                    max_append_bytes: 1 << 20,
+                    send_before_persist: true,
                 };
                 configure(&mut config);
                 let mut node = Node {
@@ -174,16 +177,24 @@ impl Cluster {
 
 #[test]
 fn a_client_that_only_knows_a_follower_finds_the_leader() {
-    every_operation_through_a_follower(ReadMode::ReadIndex);
+    every_operation_through_a_follower(|_| {});
 }
 
 #[test]
 fn reads_through_the_log_give_the_same_answers() {
-    every_operation_through_a_follower(ReadMode::Log);
+    every_operation_through_a_follower(|config| config.read_mode = ReadMode::Log);
 }
 
-fn every_operation_through_a_follower(read_mode: ReadMode) {
-    let cluster = Cluster::start(3, read_mode);
+#[test]
+fn unbatched_replication_persisted_before_sending_gives_the_same_answers() {
+    every_operation_through_a_follower(|config| {
+        config.batch_appends = false;
+        config.send_before_persist = false;
+    });
+}
+
+fn every_operation_through_a_follower(configure: impl Fn(&mut ServerConfig)) {
+    let cluster = Cluster::start_with(3, configure);
     let leader = cluster.leader();
     let follower = (leader + 1) % 3;
     let mut client = cluster.client(&[follower]);
@@ -317,6 +328,9 @@ fn a_node_without_its_data_directory_refuses_to_start() {
         read_mode: ReadMode::ReadIndex,
         snapshot_threshold_bytes: 1 << 20,
         retained_entries: 16,
+        batch_appends: true,
+        max_append_bytes: 1 << 20,
+        send_before_persist: true,
     };
     let runtime = Runtime::new().expect("runtime");
     let result = runtime.block_on(server::start(config, DataDir::MustExist));

@@ -7,9 +7,11 @@
 //! `raft_core::Ready`):
 //!
 //! 1. every tick, message from a peer and client request goes into Raft;
-//! 2. the resulting log entries and hard state are synced to disk;
-//! 3. only then are messages sent, so no vote or acknowledgement is ever
-//!    sent for state that could still be lost;
+//! 2. the resulting log entries and hard state are synced to disk; a
+//!    leader's `AppendEntries` go out just before, so that its fsync
+//!    overlaps with the round trip to its followers;
+//! 3. only then are the other messages sent, so no vote or acknowledgement
+//!    is ever sent for state that could still be lost;
 //! 4. committed entries are applied to the key-value store, and waiting
 //!    clients get their answers.
 //!
@@ -162,6 +164,8 @@ pub async fn start(config: ServerConfig, data_dir: DataDir) -> Result<Server, St
     let peer_ids = config.peers.iter().map(|peer| NodeId(peer.id)).collect();
     let mut raft_config = Config::new(id, peer_ids, seed(id));
     raft_config.retained_entries = config.retained_entries;
+    raft_config.batch_appends = config.batch_appends;
+    raft_config.max_append_bytes = config.max_append_bytes;
     let raft = Raft::restore_with_snapshot(
         raft_config,
         recovered.hard_state,
@@ -197,7 +201,8 @@ pub async fn start(config: ServerConfig, data_dir: DataDir) -> Result<Server, St
         .serve_with_incoming(TcpListenerStream::new(listener));
 
     let node = Node::new(raft, storage, kv, peers, addresses)
-        .with_snapshot_threshold(config.snapshot_threshold_bytes);
+        .with_snapshot_threshold(config.snapshot_threshold_bytes)
+        .with_send_before_persist(config.send_before_persist);
     let span = tracing::info_span!("node", id = id.0);
     let node = tokio::spawn(
         node.run(inbox_receiver, request_receiver, config.tick())
