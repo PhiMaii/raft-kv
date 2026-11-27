@@ -7,6 +7,8 @@
 # also on failure or Ctrl-C.
 #
 # Usage: scripts/sim-mutations.sh [seeds]   (default: 1000)
+#
+# With MUTATIONS_JSON=FILE, the results are also written to FILE as JSON.
 
 set -euo pipefail
 
@@ -23,6 +25,7 @@ if ! git diff --quiet -- "${FILES[@]}"; then
   exit 1
 fi
 trap 'git checkout -q -- "${FILES[@]}"' EXIT
+RESULTS="$(mktemp)"
 
 mutate() {
   local file="$1" name="$2" from="$3" to="$4"
@@ -45,6 +48,7 @@ EOF
   failed="$(grep -o '[0-9]* failed' <<<"$output" | head -1)"
   kind="$(grep -m1 -o 'violated [a-z ]* at' <<<"$output" | sed 's/violated //; s/ at$//' || true)"
   printf '%-45s %-12s %s\n' "$name" "$failed" "${kind:--}"
+  printf '%s\t%s\t%s\n' "$name" "${failed%% *}" "$kind" >>"$RESULTS"
   git checkout -q -- "$file"
 }
 
@@ -97,3 +101,15 @@ mutate "$RAFT" "count a follower after one snapshot chunk" \
             progress.match_index' \
   'if done || received > 0 {
             progress.match_index'
+
+if [[ -n "${MUTATIONS_JSON:-}" ]]; then
+  python3 -I -c 'import json, sys
+seeds, path = int(sys.argv[1]), sys.argv[2]
+mutations = []
+for line in open(path):
+    name, caught, kind = line.rstrip("\n").split("\t")
+    mutations.append({"name": name, "caught": int(caught or 0), "first_violation": kind or None})
+print(json.dumps({"seeds": seeds, "mutations": mutations}, indent=2))' \
+    "$SEEDS" "$RESULTS" >"$MUTATIONS_JSON"
+fi
+rm -f "$RESULTS"
