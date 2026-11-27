@@ -24,6 +24,12 @@ pub struct SimConfig {
     /// to never, along with the log tail kept behind each snapshot and the
     /// size of `InstallSnapshot` chunks.
     pub snapshot_threshold: Option<u64>,
+    /// Whether leaders batch replication (`Config::batch_appends`). `None`
+    /// picks on or off per seed.
+    pub batch_appends: Option<bool>,
+    /// Whether leaders send their replication messages before their own
+    /// fsync. `None` picks on or off per seed.
+    pub send_before_persist: Option<bool>,
     /// Number of concurrent clients. Each has its own session and at most
     /// one request in flight.
     pub clients: usize,
@@ -158,6 +164,8 @@ impl Default for SimConfig {
             log_check_interval: 10,
             max_entries_per_append: None,
             snapshot_threshold: None,
+            batch_appends: None,
+            send_before_persist: None,
             clients: 5,
             keys: 3,
             request: Chance::percent(30),

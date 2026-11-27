@@ -86,6 +86,48 @@ fn random_seeds_pass_under_faults() {
 }
 
 #[test]
+fn runs_pass_with_batching_and_early_sends_on_and_off() {
+    for (batch_appends, send_before_persist) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let config = SimConfig {
+            batch_appends: Some(batch_appends),
+            send_before_persist: Some(send_before_persist),
+            ..SimConfig::default()
+        };
+        run_all(4_000..4_000 + seed_count() / 8, &config);
+    }
+}
+
+#[test]
+fn batching_sends_fewer_entries() {
+    // Entries sent per committed entry, in tenths.
+    let entries_sent = |batch_appends| {
+        let config = SimConfig {
+            batch_appends: Some(batch_appends),
+            faults: FaultConfig::none(),
+            request: sim::Chance::percent(100),
+            ticks: 1_000,
+            ..SimConfig::default()
+        };
+        let stats = run_all(5_000..5_005, &config);
+        let sent: u64 = stats.iter().map(|s| s.entries_sent).sum();
+        let committed: u64 = stats.iter().map(|s| s.committed_index).sum();
+        sent * 10 / committed
+    };
+    let (batched, unbatched) = (entries_sent(true), entries_sent(false));
+    // Four followers: every entry must reach each of them at least once.
+    // Heartbeats and ReadIndex rounds resend a few more. When every answer
+    // sent more entries, this was about 600 (see the bug log).
+    assert!((40..=120).contains(&batched), "{batched}");
+    assert!(unbatched <= 300, "{unbatched}");
+    assert!(
+        batched * 3 < unbatched * 2,
+        "entries sent per committed entry, in tenths: {batched} batched, {unbatched} unbatched"
+    );
+}
+
+#[test]
 fn long_runs_keep_the_log_bounded() {
     let config = SimConfig {
         ticks: 20_000,
