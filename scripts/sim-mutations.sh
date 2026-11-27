@@ -14,7 +14,8 @@ SEEDS="${1:-1000}"
 RAFT="crates/raft-core/src/raft.rs"
 WAL="crates/storage/src/wal.rs"
 KV="crates/kv/src/store.rs"
-FILES=("$RAFT" "$WAL" "$KV")
+KV_SNAPSHOT="crates/kv/src/snapshot.rs"
+FILES=("$RAFT" "$WAL" "$KV" "$KV_SNAPSHOT")
 cd "$(git rev-parse --show-toplevel)"
 
 if ! git diff --quiet -- "${FILES[@]}"; then
@@ -83,3 +84,16 @@ mutate "$RAFT" "serve reads before committing in the term" \
             for read in &mut self.pending_reads {'
 mutate "$KV" "apply a retried request again" \
   'if sequence == session.sequence {' 'if false && sequence == session.sequence {'
+mutate "$KV_SNAPSHOT" "leave the session table out of snapshots" \
+  'out.extend_from_slice(&(store.sessions.len() as u64).to_le_bytes());
+    for (client_id, session) in &store.sessions {' \
+  'out.extend_from_slice(&0u64.to_le_bytes());
+    for (client_id, session) in store.sessions.iter().take(0) {'
+mutate "$RAFT" "keep a conflicting log after a snapshot" \
+  'if self.log.term_at(snapshot.index) == Some(snapshot.term) {' \
+  'if self.log.last_index() >= snapshot.index {'
+mutate "$RAFT" "count a follower after one snapshot chunk" \
+  'if done {
+            progress.match_index' \
+  'if done || received > 0 {
+            progress.match_index'

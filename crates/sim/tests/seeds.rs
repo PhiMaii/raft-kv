@@ -75,6 +75,34 @@ fn random_seeds_pass_under_faults() {
     );
     assert!(total(|s| s.operations_unknown) > 0, "no unknown outcomes");
     assert!(total(|s| s.responses_lost) > 0, "no responses lost");
+
+    // Snapshots: nodes compact their logs, and lagging followers catch up
+    // through InstallSnapshot.
+    assert!(total(|s| s.snapshots_taken) > 0, "no snapshots taken");
+    assert!(
+        total(|s| s.snapshots_installed) > 0,
+        "no snapshots installed"
+    );
+}
+
+#[test]
+fn long_runs_keep_the_log_bounded() {
+    let config = SimConfig {
+        ticks: 20_000,
+        snapshot_threshold: Some(1_000),
+        ..SimConfig::default()
+    };
+    let stats = run_all(3_000..3_004, &config);
+    for s in &stats {
+        // Without snapshots every node would hold every committed entry.
+        assert!(
+            s.committed_index > 500 && s.max_log_entries * 5 < s.committed_index,
+            "log not bounded: {} entries held, {} committed",
+            s.max_log_entries,
+            s.committed_index
+        );
+    }
+    assert!(stats.iter().any(|s| s.snapshots_installed > 0));
 }
 
 #[test]
