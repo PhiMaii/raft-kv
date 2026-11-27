@@ -109,6 +109,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with its own server settings; `scripts/fsync-probe.py` measures how long
   a sync takes with one or several processes on the same disk. Results are
   in `bench/results/` and on the Benchmarks page.
+- `scripts/bench.sh record`: every scenario three times, the median run
+  per scenario appended to `bench/history/MACHINE.jsonl` with the commit,
+  machine, power source and an fsync calibration; refuses to run on
+  battery or with uncommitted changes.
 - A local five-node cluster: `scripts/cluster.sh` (start, stop, kill and
   restart single nodes, status, logs, clean), `docker-compose.yml` with a
   `Dockerfile`, and example configurations in `config/`.

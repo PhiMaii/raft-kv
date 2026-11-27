@@ -94,6 +94,36 @@ milliseconds; it matters when the network is slow. Neither question can be
 settled on one laptop. Both settings stay configurable so that they can be
 measured on separate machines.
 
+## History
+
+The results above are single runs. To follow performance across
+milestones, `scripts/bench.sh record LABEL` runs every scenario three
+times, in whole rounds so that slow drift (heat, background work) affects
+all scenarios alike, and keeps the run with the median throughput. It
+appends one JSON line per scenario to `bench/history/MACHINE.jsonl`, which
+is committed with the milestone's pull request, so every data point
+belongs to the code it measured. Each line holds:
+
+- the label (milestone or release), the commit and the date;
+- the machine: CPU, cores, memory, OS and its version;
+- the power source: `record` refuses to run on battery, where laptops
+  throttle;
+- an **fsync calibration**: how long a 200-byte append takes to sync with
+  one process and with three at once (`scripts/fsync-probe.py`). If the
+  machine gets slower or faster, for example after an OS update, this
+  shows it, and the change is not mistaken for one in the code;
+- the scenario, its cluster size and server settings, the three runs'
+  throughputs, and the median run's throughput and latency percentiles.
+
+**One machine, one series.** All history so far comes from one Apple M3
+laptop with every node on it and real `F_FULLFSYNC`
+(`bench/history/apple-m3-16gib-macos.jsonl`). The file is named after the
+machine, so results from another machine start a series of their own and
+are never mixed into this one. History is recorded at the end of each
+milestone, by hand: a scheduled job on a laptop runs whenever the laptop
+happens to be awake, on whatever power, which would make the series
+noisier, not better.
+
 ## Limitations
 
 - These are macOS numbers. The [specification](spec.md) asks for published
