@@ -113,6 +113,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per scenario appended to `bench/history/MACHINE.jsonl` with the commit,
   machine, power source and an fsync calibration; refuses to run on
   battery or with uncommitted changes.
+- `scripts/bench-graphs.py` renders the benchmark history as SVG charts
+  (throughput and p99 per milestone, latency percentiles and A/B
+  comparisons of the latest record) that follow the viewer's light or dark
+  scheme; the docs workflow publishes them with the site.
+- The nightly workflow also runs the mutation tests and fails if an
+  injected bug goes uncaught; both jobs write JSON (`raft-kv-sim --json`,
+  `MUTATIONS_JSON`), and the site turns the latest results into README
+  badges.
 - A local five-node cluster: `scripts/cluster.sh` (start, stop, kill and
   restart single nodes, status, logs, clean), `docker-compose.yml` with a
   `Dockerfile`, and example configurations in `config/`.

@@ -1,16 +1,22 @@
 name: Publish docs
 
-# Publishes the documentation site to GitHub Pages on every push to main:
-# the mdBook (design, testing methodology, bug log) at the root and the
-# rustdoc API reference under /api/.
+# Publishes the documentation site to GitHub Pages on every push to main
+# and after every nightly simulation: the mdBook (design, testing
+# methodology, bug log) at the root, the rustdoc API reference under /api/,
+# the benchmark graphs under /graphs/ (rendered from bench/history/), and
+# badges with the latest nightly results under /graphs/badges/.
 
 on:
   push:
     branches: [main]
+  workflow_run:
+    workflows: [Simulation (nightly)]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: pages
@@ -36,6 +42,23 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: Fetch the latest nightly results
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The latest completed run, failed or not: a failure must show.
+          run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow sim-nightly.yml \
+            --status completed --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          mkdir -p nightly
+          if [[ -n "$run_id" ]]; then
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --dir nightly || true
+          fi
+          find nightly -type f
+      - name: Render the benchmark graphs and badges
+        run: |
+          python3 scripts/bench-graphs.py bench/history docs/book/graphs \
+            --sim-stats nightly/nightly-simulation/sim-stats.json \
+            --mutation-stats nightly/nightly-mutations/mutations.json
       - name: Assemble the site
         run: cp -r target/doc docs/book/api
       - uses: actions/configure-pages@v5

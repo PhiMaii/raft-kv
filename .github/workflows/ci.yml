@@ -72,3 +72,5 @@ jobs:
         with:
           tool: mdbook
       - run: mdbook build docs
+      - name: Render the benchmark graphs
+        run: python3 scripts/bench-graphs.py bench/history target/graphs
