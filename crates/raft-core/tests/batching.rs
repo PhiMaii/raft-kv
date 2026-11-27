@@ -201,3 +201,28 @@ fn only_a_leaders_replication_messages_may_go_before_persisting() {
     assert_eq!(answers.len(), 2);
     assert!(!answers.iter().any(Message::may_send_before_persisting));
 }
+
+#[test]
+fn only_answers_that_show_progress_send_more() {
+    // Regression test: every answer used to send the follower its missing
+    // entries, so each heartbeat started another chain of appends while the
+    // follower was behind, and the chains piled up into a message storm.
+    let mut raft = leader(|config| config.max_entries_per_append = 1);
+    for byte in 0..3 {
+        raft.propose(vec![byte]).expect("leader");
+    }
+    let _ = raft.take_ready();
+
+    ack(&mut raft, N2, 2);
+    assert_eq!(appends_to(&raft.take_ready().messages, N2), vec![vec![3]]);
+    // The same answer again, or an answer to an older heartbeat, tells the
+    // leader nothing new.
+    ack(&mut raft, N2, 2);
+    ack(&mut raft, N2, 1);
+    assert_eq!(
+        appends_to(&raft.take_ready().messages, N2),
+        Vec::<Vec<u64>>::new()
+    );
+    ack(&mut raft, N2, 3);
+    assert_eq!(appends_to(&raft.take_ready().messages, N2), vec![vec![4]]);
+}

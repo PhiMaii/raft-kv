@@ -3,6 +3,29 @@
 Every real bug found by the tests is recorded here, newest first. A bug only
 counts once it has a regression test.
 
+## 2026-11-27: Replication answers multiplied into a message storm
+
+- **Found by:** the simulator's new `entries_sent` counter, added to measure
+  batching: on some seeds every committed entry was sent about 600 times,
+  and a five-node cluster exchanged 375 messages per tick. Present since
+  log replication was first written; found before batching was merged.
+- **Symptom:** no wrong results, but far more traffic than needed whenever
+  a follower was behind: hundreds of thousands of messages in a 15-second
+  simulated run instead of about 7,000.
+- **Root cause:** the leader answered every successful
+  `AppendEntriesResponse` from a follower that was still behind by sending
+  it the next entries. Heartbeats and ReadIndex rounds are answered too, so
+  each of them started another send-and-answer chain. Chains only end once
+  the follower catches up, so under steady load they piled up. Small
+  `max_entries_per_append` values made followers stay behind longest.
+- **Fix:** the leader sends more only when an answer shows progress (a
+  higher match index). An answer that tells it nothing new ends its chain;
+  a lost message is resent by the next heartbeat. The same rule already
+  applied to `InstallSnapshot` chunks for the same reason.
+- **Regression test:** `only_answers_that_show_progress_send_more` in
+  `crates/raft-core/tests/batching.rs`, and an upper bound on entries sent
+  per committed entry in the simulator test `batching_sends_fewer_entries`.
+
 ## 2026-11-26: Every follower restart deposed a healthy leader
 
 - **Found by:** manual testing of the local cluster script: after

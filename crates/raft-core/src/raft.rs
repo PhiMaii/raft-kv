@@ -598,9 +598,6 @@ impl Raft {
                 // Any answer in our term, even a failed consistency check,
                 // shows the follower still accepts us as leader.
                 self.handle_read_ack(from, read_round);
-                if let Some(progress) = self.progress.get_mut(&from) {
-                    progress.in_flight = false;
-                }
                 if success {
                     self.handle_append_success(from, match_index);
                 } else {
@@ -978,12 +975,22 @@ impl Raft {
             return;
         };
         // Responses can arrive out of order; never move backwards.
+        let progressed = match_index > progress.match_index;
         progress.match_index = progress.match_index.max(match_index);
         progress.next_index = progress.next_index.max(progress.match_index.next());
         let caught_up = progress.next_index > self.log.last_index();
+        // Continue only on progress. Every heartbeat and ReadIndex round
+        // gets an answer too; if each of those answers sent the next batch,
+        // each would start a chain of appends of its own, and the chains
+        // would pile up for as long as the follower is behind. An answer
+        // that tells the leader nothing new ends its chain; if a message was
+        // lost, the next heartbeat resends.
+        if progressed {
+            progress.in_flight = false;
+        }
 
         self.maybe_commit();
-        if !caught_up {
+        if progressed && !caught_up {
             self.send_append(peer);
         }
     }
@@ -1006,6 +1013,7 @@ impl Raft {
         let Some(progress) = self.progress.get_mut(&peer) else {
             return;
         };
+        progress.in_flight = false;
         // Never go below what is known to match, and never past our log.
         progress.next_index = next
             .max(progress.match_index.next())
