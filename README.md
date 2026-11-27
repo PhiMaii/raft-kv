@@ -3,6 +3,8 @@
 [![CI](https://github.com/PhiMaii/raft-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/PhiMaii/raft-kv/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Docs](https://img.shields.io/badge/docs-phimaii.github.io%2Fraft--kv-informational.svg)](https://phimaii.github.io/raft-kv/)
+[![Nightly simulation](https://img.shields.io/endpoint?url=https://phimaii.github.io/raft-kv/graphs/badges/simulation.json)](https://github.com/PhiMaii/raft-kv/actions/workflows/sim-nightly.yml)
+[![Injected bugs caught](https://img.shields.io/endpoint?url=https://phimaii.github.io/raft-kv/graphs/badges/mutations.json)](https://github.com/PhiMaii/raft-kv/actions/workflows/sim-nightly.yml)
 
 A replicated, linearizable key-value store built from scratch on the
 [Raft](https://raft.github.io/) consensus algorithm, written in Rust.
@@ -127,6 +129,14 @@ behind each other, so these numbers say more about the laptop's disk than
 about a deployed cluster. [Benchmarks](docs/src/benchmarks.md) has every
 scenario, the analysis, and the exact command to reproduce them:
 `scripts/bench.sh matrix`.
+
+Every milestone is measured again the same way (three runs each, the
+median kept) and recorded in `bench/history/`. The site renders that
+history on every push:
+
+[![Throughput per milestone](https://phimaii.github.io/raft-kv/graphs/apple-m3-16gib-macos/throughput.svg)](https://phimaii.github.io/raft-kv/graphs/apple-m3-16gib-macos/throughput.svg)
+
+[![A/B comparisons](https://phimaii.github.io/raft-kv/graphs/apple-m3-16gib-macos/comparisons.svg)](https://phimaii.github.io/raft-kv/graphs/apple-m3-16gib-macos/comparisons.svg)
 
 ## Documentation
 

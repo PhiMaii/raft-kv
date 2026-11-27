@@ -3,6 +3,7 @@
 //! ```text
 //! raft-kv-sim [--seeds N] [--start S] [--ticks T]   run seeds S..S+N
 //! raft-kv-sim --seed S [--ticks T]                  run one seed and print its report
+//! raft-kv-sim ... --json FILE                       also write a summary as JSON
 //! ```
 //!
 //! Build with `--release`: a run is thousands of ticks across five nodes.
@@ -16,6 +17,7 @@ struct Args {
     start: u64,
     count: u64,
     single: bool,
+    json: Option<String>,
     config: SimConfig,
 }
 
@@ -24,6 +26,7 @@ fn parse_args() -> Result<Args, String> {
         start: 0,
         count: 1_000,
         single: false,
+        json: None,
         config: SimConfig::default(),
     };
     let mut iter = std::env::args().skip(1);
@@ -43,9 +46,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--ticks" => args.config.ticks = value()?,
             "--nodes" => args.config.nodes = value()?,
+            "--json" => {
+                args.json = Some(iter.next().ok_or("--json needs a file name")?);
+            }
             "-h" | "--help" => {
                 return Err("usage: raft-kv-sim [--seeds N] [--start S] [--seed S] \
-                     [--ticks T] [--nodes N]"
+                     [--ticks T] [--nodes N] [--json FILE]"
                     .to_owned())
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -97,6 +103,27 @@ fn main() -> ExitCode {
         started.elapsed(),
         failures.len(),
     );
+    if let Some(path) = &args.json {
+        // Hand-written to keep the simulator free of dependencies.
+        let failing: Vec<String> = failures.iter().map(u64::to_string).collect();
+        let json = format!(
+            "{{\"seeds\": {}, \"start\": {}, \"ticks\": {}, \"nodes\": {}, \
+             \"failed\": {}, \"failing_seeds\": [{}], \"entries_committed\": {committed}, \
+             \"operations_checked\": {operations}, \"crashes\": {crashes}, \
+             \"partitions\": {partitions}, \"seconds\": {:.1}}}\n",
+            args.count,
+            args.start,
+            args.config.ticks,
+            args.config.nodes,
+            failures.len(),
+            failing.join(", "),
+            started.elapsed().as_secs_f64(),
+        );
+        if let Err(error) = std::fs::write(path, json) {
+            eprintln!("cannot write {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
     if failures.is_empty() {
         ExitCode::SUCCESS
     } else {

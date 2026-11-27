@@ -295,6 +295,8 @@ time, and counts how many seeds detect each:
 | Snapshots: count a follower as caught up after one chunk | 322 | liveness |
 
 Measured with `scripts/sim-mutations.sh 1000` on the default configuration.
+The nightly workflow runs the same script and fails if any injected bug
+goes uncaught; its results appear as a badge in the README.
 The counts move a little whenever the simulator draws new per-seed
 settings (snapshots, batching), because every seed then runs a different
 schedule.

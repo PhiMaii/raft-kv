@@ -1,8 +1,12 @@
 name: Simulation (nightly)
 
-# Runs far more simulation seeds than the regular test suite. Every night
-# starts at a new offset, so the seed space covered keeps growing. A failing
+# Runs far more simulation seeds than the regular test suite, and checks
+# that the simulator still catches every injected bug. Every night starts
+# at a new seed offset, so the seed space covered keeps growing. A failing
 # seed is printed together with the command that reproduces it.
+#
+# Both jobs upload their results as JSON, also when they fail, and the
+# docs workflow turns the latest results into badges on the site.
 
 on:
   schedule:
@@ -35,7 +39,7 @@ jobs:
         run: |
           start=$(( START * 1000000 ))
           cargo run -q -p sim --release -- --seeds "$SEEDS" --start "$start" \
-            2>&1 | tee sim.log
+            --json sim-stats.json 2>&1 | tee sim.log
       - name: Summary
         if: always()
         run: |
@@ -45,3 +49,43 @@ jobs:
             tail -n 40 sim.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: nightly-simulation
+          path: sim-stats.json
+          if-no-files-found: ignore
+
+  mutations:
+    name: Mutation tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Inject known bugs
+        env:
+          MUTATIONS_JSON: mutations.json
+        run: scripts/sim-mutations.sh 1000 | tee mutations.log
+      - name: Check that every bug was caught
+        run: |
+          python3 -I -c 'import json, sys
+          missed = [m["name"] for m in json.load(open("mutations.json"))["mutations"] if not m["caught"]]
+          if missed:
+              sys.exit("not caught: " + ", ".join(missed))'
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Mutation tests (1,000 seeds each)'
+            echo '```'
+            cat mutations.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: nightly-mutations
+          path: mutations.json
+          if-no-files-found: ignore

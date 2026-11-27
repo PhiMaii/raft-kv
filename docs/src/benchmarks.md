@@ -96,6 +96,27 @@ measured on separate machines.
 
 ## History
 
+These charts are drawn from `bench/history/` every time the site is
+published. Click a chart to open it on its own; there, hovering over a
+point shows its exact values and the three runs behind it.
+
+[![Throughput per milestone](graphs/apple-m3-16gib-macos/throughput.svg)](graphs/apple-m3-16gib-macos/throughput.svg)
+
+[![99th-percentile latency per milestone](graphs/apple-m3-16gib-macos/p99.svg)](graphs/apple-m3-16gib-macos/p99.svg)
+
+[![Latency percentiles of the latest record](graphs/apple-m3-16gib-macos/percentiles.svg)](graphs/apple-m3-16gib-macos/percentiles.svg)
+
+[![A/B comparisons of the latest record](graphs/apple-m3-16gib-macos/comparisons.svg)](graphs/apple-m3-16gib-macos/comparisons.svg)
+
+To render them locally:
+
+```bash
+mdbook build docs
+scripts/bench-graphs.py bench/history docs/book/graphs
+```
+
+### How the history is recorded
+
 The results above are single runs. To follow performance across
 milestones, `scripts/bench.sh record LABEL` runs every scenario three
 times, in whole rounds so that slow drift (heat, background work) affects
