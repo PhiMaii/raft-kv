@@ -5,8 +5,8 @@ use std::panic::{self, AssertUnwindSafe};
 
 use kv::{Command, Envelope, KvConfig, KvStore, Operation, Rejection, Response};
 use raft_core::{
-    Config, EntryPayload, LogIndex, NodeId, ProposeError, Raft, ReadIndexError, ReadState, Role,
-    Term,
+    Config, EntryPayload, LogIndex, Message, MessageBody, NodeId, ProposeError, Raft,
+    ReadIndexError, ReadState, Ready, Role, Term,
 };
 use storage::{SimDisk, Storage, StorageError, StorageOptions};
 
@@ -136,6 +136,9 @@ pub(crate) struct Simulation {
     /// Nodes take a snapshot once they have applied this many command bytes
     /// since the last one.
     snapshot_threshold: u64,
+    /// Whether leaders send their replication messages before persisting
+    /// (see `Message::may_send_before_persisting`).
+    send_before_persist: bool,
 }
 
 impl Simulation {
@@ -154,6 +157,13 @@ impl Simulation {
             .unwrap_or_else(|| [100, 400, 1_500, 5_000, u64::MAX][rng.index(5)]);
         let retained_entries = [0, 1, 8, 64][rng.index(4)];
         let snapshot_chunk_size = [16, 128, 1 << 20][rng.index(3)];
+        // Batched replication and sending a leader's appends before its own
+        // fsync are each on or off per seed, unless the configuration fixes
+        // them.
+        let batch_appends = rng.below(2) == 0;
+        let batch_appends = config.batch_appends.unwrap_or(batch_appends);
+        let send_before_persist = rng.below(2) == 0;
+        let send_before_persist = config.send_before_persist.unwrap_or(send_before_persist);
         let ids: Vec<NodeId> = (1..=config.nodes).map(NodeId).collect();
         let nodes = ids
             .iter()
@@ -163,6 +173,7 @@ impl Simulation {
                 raft_config.max_entries_per_append = max_entries_per_append;
                 raft_config.retained_entries = retained_entries;
                 raft_config.snapshot_chunk_size = snapshot_chunk_size;
+                raft_config.batch_appends = batch_appends;
                 let raft = Raft::new(raft_config.clone()).expect("valid raft config");
                 let (storage, _) =
                     Storage::open(SimDisk::new(), STORAGE).expect("empty disk opens");
@@ -201,6 +212,7 @@ impl Simulation {
             last_read_id: 0,
             isolated: None,
             snapshot_threshold,
+            send_before_persist,
             config,
         }
     }
@@ -591,13 +603,17 @@ impl Simulation {
             else {
                 continue;
             };
-            let ready = raft.take_ready();
+            let mut ready = raft.take_ready();
+            // A leader's replication messages may go out before its fsync,
+            // so they are sent even if it crashes while persisting.
+            let early = take_early_messages(&mut ready, self.send_before_persist);
             if self.rng.chance(self.config.faults.write_crash) {
                 let ops = self.rng.below(8);
                 storage.disk_mut().fail_after(ops);
             }
             if let Err(error) = storage.persist(&ready) {
                 let failed = storage.disk().has_failed();
+                self.send_all(early);
                 self.crash_while_writing(i, failed, &error, "writing")?;
                 continue;
             }
@@ -653,7 +669,9 @@ impl Simulation {
             if *applied_bytes >= self.snapshot_threshold {
                 *applied_bytes = 0;
                 if let Err(error) = take_snapshot(raft, storage, kv) {
+                    // The messages went out before the snapshot was taken.
                     let failed = storage.disk().has_failed();
+                    self.send_all(early.into_iter().chain(ready.messages));
                     self.crash_while_writing(i, failed, &error, "saving a snapshot")?;
                     continue;
                 }
@@ -663,15 +681,7 @@ impl Simulation {
                 .stats
                 .max_log_entries
                 .max(raft.log().entries().len() as u64);
-            for message in ready.messages {
-                self.network.send(
-                    self.now,
-                    message,
-                    &self.config.faults,
-                    &mut self.rng,
-                    &mut self.stats,
-                );
-            }
+            self.send_all(early.into_iter().chain(ready.messages));
             if role == Role::Leader && !self.trace_mentions_leader(id, term) {
                 self.event(&format!("{id} is leader in {term}"));
             }
@@ -683,6 +693,20 @@ impl Simulation {
             self.retry_soon(pending);
         }
         Ok(())
+    }
+
+    /// Hands messages to the network.
+    fn send_all(&mut self, messages: impl IntoIterator<Item = Message>) {
+        for message in messages {
+            self.stats.entries_sent += entries_in(&message);
+            self.network.send(
+                self.now,
+                message,
+                &self.config.faults,
+                &mut self.rng,
+                &mut self.stats,
+            );
+        }
     }
 
     /// Handles a failed write on node `i`: a crash injected by the
@@ -1067,6 +1091,27 @@ fn check_leader(
     }
     *observed_commit = (*observed_commit).max(commit);
     Ok(())
+}
+
+/// Removes the messages that may be sent before persisting from `ready`,
+/// if sending early is enabled.
+fn take_early_messages(ready: &mut Ready, enabled: bool) -> Vec<Message> {
+    if !enabled {
+        return Vec::new();
+    }
+    let (early, late) = std::mem::take(&mut ready.messages)
+        .into_iter()
+        .partition(Message::may_send_before_persisting);
+    ready.messages = late;
+    early
+}
+
+/// The number of log entries a message carries.
+fn entries_in(message: &Message) -> u64 {
+    match &message.body {
+        MessageBody::AppendEntries { entries, .. } => entries.len() as u64,
+        _ => 0,
+    }
 }
 
 /// Snapshots the state machine at the applied index, compacts the log and

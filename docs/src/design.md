@@ -98,16 +98,22 @@ Implemented as in Raft §5.3 and §5.4.2.
   else, and sends it to every follower immediately. A leader may only commit
   entries of its own term by counting replicas, so the no-op lets it commit
   whatever earlier terms left behind. ReadIndex reads depend on it too.
-- `propose` appends the command to the leader's log and sends it to every
-  follower right away; it does not wait for the next heartbeat.
+- `propose` appends the command to the leader's log. It goes out right
+  away to every follower that has no `AppendEntries` waiting for an answer;
+  for the others it waits (see [Batching](#batching)). Either way, it does
+  not wait for the next heartbeat.
 - For each follower the leader tracks `next_index` (the next entry to send)
   and `match_index` (the highest entry known to be on the follower). Every
-  `AppendEntries` carries all entries from `next_index` on, capped at
-  `max_entries_per_append`. Heartbeats are the same message, so they also
+  `AppendEntries` carries the entries from `next_index` on, capped at
+  `max_entries_per_append` entries and about `max_append_bytes` bytes (1 MiB),
+  but always at least one. Heartbeats are the same message, so they also
   carry any entries a follower is still missing.
 - After a successful response the leader raises `match_index` (never lowers
-  it, since responses can be reordered) and, if the follower is still behind,
-  sends the next batch.
+  it, since responses can be reordered). If that is progress and the
+  follower is still behind, it sends the next batch. An answer that shows
+  no progress, such as a duplicate or the answer to a heartbeat, sends
+  nothing: otherwise every heartbeat would start another chain of appends
+  (see the [bug log](bugs.md)).
 - The leader **commits** the highest index stored on a majority (counting
   itself), but only if that entry is from the current term (the Figure 8
   rule). Earlier entries then become committed along with it.
@@ -131,6 +137,42 @@ Implemented as in Raft §5.3 and §5.4.2.
   `min(leader_commit, last index of this message)`. Entries after what the
   message proved may still differ from the leader's log, so they are not
   committed yet.
+
+### Batching
+
+Under load, many writes arrive while the leader's last `AppendEntries` to a
+follower is still on its way. Sending each one at once, with everything the
+follower has not acknowledged yet, would put most entries on the wire many
+times. Instead (`batch_appends`, on by default):
+
+- a follower with **nothing in flight** gets a new entry at once, so an idle
+  cluster pays no extra latency;
+- for a follower with an append **in flight**, new entries wait. The answer
+  to that append sends all of them in one message, up to the size limits;
+- a lost message or answer leaves the batch waiting until the next
+  heartbeat (50 ms), which resends everything the follower is missing.
+
+The node loop batches too: everything that arrives while it handles one
+round is taken in the next, so a round's entries share one fsync and one
+message per follower.
+
+This is stop-and-wait per follower: one append in flight at a time. In
+fault-free simulations it cuts the entries sent per committed entry by
+40–50 %. It can add up to one round trip of latency to a write that arrives
+just after a send, so with clients that each wait for their last answer,
+the unbatched mode commits 15–20 % more. Allowing several appends in flight (pipelining, as etcd does)
+would remove that cost; whether it is worth the extra state is a question
+for the benchmarks.
+
+**The leader's fsync overlaps with the network** (`send_before_persist`,
+Raft dissertation §10.2.1). A leader's `AppendEntries` carry its own log and
+promise nothing about its disk, so the node loop sends them before it
+persists the round, and only holds back votes and answers until the fsync
+is done. The leader still counts itself towards a majority only for entries
+on its disk: answers are handled in a later round, after this round's
+fsync. If the leader crashes before its fsync, followers may hold entries
+it lost; they were never committed, and the next leader overwrites them as
+usual. The simulator runs every seed with each of these on or off.
 
 ### Applying
 
@@ -357,9 +399,10 @@ channels, so nothing needs a lock. Each round of the loop:
 
 1. takes one event (a tick, a message from a peer or a client request), then
    drains whatever else is already waiting, up to 256 of each;
-2. persists the resulting hard state and entries with one fsync for the
-   whole round, before anything is sent;
-3. sends the messages to the peers' queues;
+2. sends a leader's `AppendEntries`, then persists the resulting hard state
+   and entries with one fsync for the whole round;
+3. sends the other messages (votes and answers) only now, once what they
+   promise is on disk;
 4. applies committed entries to the `KvStore` and answers waiting clients.
 
 A client request becomes a proposal, remembered with its index and the

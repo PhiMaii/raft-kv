@@ -43,6 +43,13 @@ raft-kv is tested at four levels:
   is acknowledged at once; duplicate acknowledgements do not multiply
   chunks; a node restarts from its snapshot, and refuses a log that does
   not continue it.
+- **Batching tests** (`crates/raft-core/tests/batching.rs`): an idle leader
+  sends at once and a busy one batches until the answer arrives; without
+  batching every proposal resends everything unacknowledged; a failed
+  consistency check also releases the batch; a lost batch goes out with
+  the next heartbeat; appends respect the byte limit but carry at least one
+  entry; only answers that show progress send more; only a leader's
+  replication messages may go before persisting.
 - **In-memory cluster tests** (`crates/raft-core/tests/cluster.rs`):
   - 3- and 5-node clusters across hundreds of seeds elect exactly one leader,
     re-elect after the leader is cut off, and never elect a leader in a
@@ -122,7 +129,8 @@ raft-kv is tested at four levels:
   three nodes in one process, each in a Tokio runtime of its own so it can
   be killed together with its connections. A client that only knows a
   follower finds the leader and runs every operation, with reads through
-  ReadIndex and through the log; acknowledged writes
+  ReadIndex, through the log, and with batching and early sends off;
+  acknowledged writes
   survive the leader being killed; the old leader restarts from its data
   directory and catches up as a follower; a follower that was down while
   the leader compacted its log catches up through `InstallSnapshot`, and
@@ -166,6 +174,11 @@ disk. The node then restarts by recovering from that disk.
 Each seed also picks how many entries an `AppendEntries` may carry (1 to
 1,024). Small batches make followers catch up piece by piece, which opens
 timing windows that some bugs need.
+
+Each seed also turns batched replication and sending a leader's appends
+before its fsync on or off. A crash while persisting still delivers the
+appends sent early, so runs cover followers that hold entries their leader
+lost. A separate test runs every combination.
 
 Snapshot settings vary per seed as well: nodes snapshot after every 100,
 400, 1,500 or 5,000 applied command bytes, or never; they keep 0, 1, 8 or
@@ -265,22 +278,22 @@ time, and counts how many seeds detect each:
 
 | Injected bug | Seeds that caught it (of 1,000) | Detected as |
 |---|---|---|
-| Vote twice in one term | 906 | election safety |
-| Skip the election restriction | 999 | leader completeness |
-| Commit an older term's entry by counting replicas (Figure 8) | 6 | leader completeness |
-| Follower commits beyond what the leader's message proved | 752 | panic (an internal assertion) |
+| Vote twice in one term | 911 | election safety |
+| Skip the election restriction | 1,000 | leader completeness |
+| Commit an older term's entry by counting replicas (Figure 8) | 11 | leader completeness |
+| Follower commits beyond what the leader's message proved | 734 | panic (an internal assertion) |
 | Storage: shorten a WAL segment before removing the segments after it | 1 | recovery |
-| ReadIndex: serve reads without confirming leadership | 19 | linearizability |
-| ReadIndex: serve reads before the leader commits in its term | 536 | linearizability |
-| State machine: apply a retried request again | 978 | linearizability |
-| Snapshots: leave the session table out | 770 | state machine safety |
-| Snapshots: keep a log that conflicts with an installed snapshot | 4 | recovery |
-| Snapshots: count a follower as caught up after one chunk | 360 | liveness |
+| ReadIndex: serve reads without confirming leadership | 8 | linearizability |
+| ReadIndex: serve reads before the leader commits in its term | 542 | linearizability |
+| State machine: apply a retried request again | 946 | linearizability |
+| Snapshots: leave the session table out | 747 | state machine safety |
+| Snapshots: keep a log that conflicts with an installed snapshot | 5 | recovery |
+| Snapshots: count a follower as caught up after one chunk | 322 | liveness |
 
 Measured with `scripts/sim-mutations.sh 1000` on the default configuration.
-The counts for the older bugs moved a little when snapshots arrived: each
-seed now also draws its snapshot settings, so every seed runs a different
-schedule than before.
+The counts move a little whenever the simulator draws new per-seed
+settings (snapshots, batching), because every seed then runs a different
+schedule.
 
 The Figure 8 and follower-commit bugs need rare interleavings: a leader that
 crashes right after its election, and a badly delayed message. They were not

@@ -58,6 +58,20 @@ pub struct ServerConfig {
     /// receiving the whole snapshot.
     #[serde(default = "default_retained_entries")]
     pub retained_entries: u64,
+    /// Whether the leader batches replication: while an `AppendEntries` to
+    /// a follower waits for its answer, new entries wait with it. Off, every
+    /// write is sent at once, with everything the follower has not
+    /// acknowledged yet.
+    #[serde(default = "default_true")]
+    pub batch_appends: bool,
+    /// About how many bytes of entries one `AppendEntries` may carry.
+    #[serde(default = "default_max_append_bytes")]
+    pub max_append_bytes: usize,
+    /// Whether the leader sends its `AppendEntries` before its own fsync
+    /// finishes, so that writing to its disk overlaps with the round trip
+    /// to its followers (Raft dissertation §10.2.1).
+    #[serde(default = "default_true")]
+    pub send_before_persist: bool,
 }
 
 /// How the leader serves linearizable reads.
@@ -97,6 +111,14 @@ fn default_snapshot_threshold_bytes() -> u64 {
 
 fn default_retained_entries() -> u64 {
     1024
+}
+
+fn default_max_append_bytes() -> usize {
+    1 << 20
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Why a configuration could not be used.
@@ -148,6 +170,9 @@ impl ServerConfig {
         }
         if self.request_timeout_ms == 0 {
             return invalid("request_timeout_ms must be positive");
+        }
+        if self.max_append_bytes == 0 {
+            return invalid("max_append_bytes must be positive");
         }
         if self.snapshot_threshold_bytes == 0 {
             return invalid("snapshot_threshold_bytes must be positive");
@@ -201,6 +226,8 @@ mod tests {
         assert_eq!(config.read_mode, ReadMode::ReadIndex);
         assert_eq!(config.snapshot_threshold_bytes, 64 << 20);
         assert_eq!(config.retained_entries, 1024);
+        assert!(config.batch_appends && config.send_before_persist);
+        assert_eq!(config.max_append_bytes, 1 << 20);
         let log_reads: ServerConfig =
             toml::from_str(&format!("read_mode = \"log\"\n{VALID}")).expect("valid");
         assert_eq!(log_reads.read_mode, ReadMode::Log);

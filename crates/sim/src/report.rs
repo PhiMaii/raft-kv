@@ -8,6 +8,10 @@ use std::fmt;
 pub struct Stats {
     /// Messages handed to the network.
     pub messages_sent: u64,
+    /// Log entries carried by `AppendEntries` messages, counting every
+    /// resend. Batching keeps this close to the number of entries times the
+    /// number of followers.
+    pub entries_sent: u64,
     /// Messages lost to random drops or partitions.
     pub messages_dropped: u64,
     /// Messages delivered twice.
