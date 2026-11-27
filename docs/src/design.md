@@ -27,20 +27,23 @@ to disk. See [ADR 0002](adr/0002-io-free-raft-core.md).
 
 ### Driving a node
 
-The caller interacts with a `Raft` node through three calls:
+The caller interacts with a `Raft` node through a handful of calls:
 
 | Call | Meaning |
 |---|---|
 | `tick()` | One unit of logical time has passed. The caller picks the tick length (e.g. 10 ms) |
 | `step(message)` | A message from another node arrived |
 | `propose(command)` | Submit a command; only the leader accepts it |
-| `take_ready()` | Collect what the calls above produced: a `Ready` with the hard state and entries to persist, the messages to send and the committed entries to apply |
+| `read_index(id)` | Start a linearizable read; only the leader accepts it (see [Read path](#read-path)) |
+| `compact(index, data)` | Hand over a snapshot of the state machine, so the log before it can go (see [Snapshots](#snapshots)) |
+| `take_ready()` | Collect what the calls above produced: a `Ready` with the hard state, snapshot and entries to persist, the messages to send and the committed entries to apply |
 
 The caller handles a `Ready` in a fixed order:
 
-1. Make `hard_state` and `entries` durable.
+1. Make `hard_state`, `snapshot` and `entries` durable.
 2. Send `messages`.
-3. Apply `committed_entries` to the state machine.
+3. If there is a `snapshot` (one received from the leader), replace the
+   state machine with it. Then apply `committed_entries`.
 
 Persisting first is what makes votes and acknowledgements binding. Otherwise
 a node could promise its vote, crash, forget the promise and vote again in
@@ -54,9 +57,11 @@ which is what the simulator relies on.
 ### The log and snapshots
 
 `Log` addresses entries by their global `LogIndex`, but stores only the
-entries after `snapshot_index`. Before snapshots exist, `snapshot_index` is
-simply 0. Every lookup goes through that offset from the start, so adding log
-compaction later does not change how the rest of the protocol uses the log.
+entries after its start position (`snapshot_index`, 0 for a log that was
+never compacted). Every lookup goes through that offset, so the rest of the
+protocol does not care whether the log was compacted. The start need not be
+the latest snapshot's index: a node keeps a tail of entries before its
+snapshot (see [Snapshots](#snapshots)).
 
 ## Leader election
 
@@ -188,7 +193,8 @@ unsynced change on a simulated crash.
 |---|---|
 | `00000000000000000001.wal`, … | WAL segments, each named after the index of its first entry |
 | `hardstate` | Current term and vote |
-| `hardstate.tmp` | Only exists briefly while the hard state is replaced |
+| `snapshot` | The latest snapshot: its index, term and the serialized state machine |
+| `hardstate.tmp`, `snapshot.tmp` | Only exist briefly while a file is replaced |
 
 A WAL record is `len: u32 | crc32: u32 | payload`, where the payload is an
 encoded entry: index, term, kind (no-op or command) and the command bytes. A
@@ -222,8 +228,10 @@ reaches stable storage and not just the drive's cache.
 
 On startup, `Storage::open`:
 
-- removes a leftover `hardstate.tmp` (its rename never happened);
-- reads and checks the hard state, and fails if it is damaged;
+- removes a leftover `hardstate.tmp` or `snapshot.tmp` (its rename never
+  happened);
+- reads and checks the hard state and the snapshot, and fails if either is
+  damaged;
 - reads every segment in order and checks that segment names and entry
   indices are contiguous;
 - treats an invalid record at the **end of the last segment** as an
@@ -232,7 +240,9 @@ On startup, `Storage::open`:
   zeros (space the file system allocated but never wrote);
 - fails with `StorageError::Corrupt` on any other damage, such as an invalid
   record with valid data after it, or a missing segment. Skipping damaged
-  entries silently could lose acknowledged writes.
+  entries silently could lose acknowledged writes;
+- checks that the log continues the snapshot (see
+  [Snapshots](#snapshots)).
 
 ## Key-value state machine
 
@@ -386,4 +396,81 @@ so a program with several concurrent workers uses one client per worker.
 
 ## Snapshots
 
-_Written in milestone 11._
+Without compaction the log grows forever, and a restarted node replays all
+of it. Snapshots (Raft §7) bound both.
+
+### Taking a snapshot
+
+A node counts the command bytes it applies. Once they reach
+`snapshot_threshold_bytes` (64 MiB by default; a byte count, because an
+entry count would fire every second at high throughput and rarely with
+large values), it snapshots its `KvStore`:
+
+1. It clones the store. The store's maps are persistent (`imbl::OrdMap`),
+   so the clone shares all data and costs almost nothing (see
+   [ADR 0006](adr/0006-persistent-maps-for-snapshots.md)).
+2. A blocking thread serializes the clone, while the node loop keeps
+   applying entries to the original.
+3. Back on the node loop, `Raft::compact(index, data)` records the
+   snapshot and drops the log before it, except for a tail of
+   `retained_entries` (1,024 by default). Followers that are only slightly
+   behind catch up from that tail instead of receiving the whole snapshot.
+4. `Storage::save_snapshot` replaces the snapshot file atomically, then
+   removes the WAL segments that hold only entries before the log's new
+   start, oldest first.
+
+The snapshot holds the data **and the session table**: a node restored
+without its sessions would apply retried requests again (the simulator
+catches exactly that when sessions are left out). It also holds the
+store's logical clock, so sessions keep expiring at the same log position
+on every node.
+
+### Sending a snapshot
+
+When a follower needs entries the leader has already compacted, the leader
+sends its latest snapshot with `InstallSnapshot` messages instead:
+
+- The snapshot goes in chunks of `snapshot_chunk_size` bytes (1 MiB),
+  **stop-and-wait**: the next chunk leaves when the follower acknowledges
+  the previous one with how many bytes it holds. Heartbeats resend the
+  current chunk, which covers lost messages.
+- The leader moves on only when an acknowledgement shows progress.
+  Otherwise every duplicated or resent chunk would answer with an
+  acknowledgement that starts yet another chain of chunks.
+- The follower accepts only the chunk that continues what it has. If a
+  transfer starts mid-way, for example after the follower restarted, it
+  asks for the beginning.
+- Each chunk carries the leader's `read_round`, so followers receiving a
+  snapshot still help confirm ReadIndex reads.
+
+Once the follower has every byte, it installs the snapshot:
+
+- If its log has the snapshot's last entry with the same term, the entries
+  after it are kept: they agree with the leader's log so far. Otherwise
+  the whole log is discarded.
+- If it has already committed past the snapshot, it ignores the snapshot
+  and just acknowledges it.
+- Its commit and applied index jump to the snapshot's index.
+  `Ready::snapshot` hands the snapshot out: the server persists it, then
+  replaces its `KvStore` with it before applying any later entries.
+
+### Persisting an installed snapshot
+
+A snapshot from the leader replaces the whole stored log. `Storage`
+replaces the snapshot file, removes every WAL segment (newest first, each
+removal synced), and writes the entries after the snapshot again. Raft
+hands those out in the same `Ready`. This is simpler than working out
+which stored entries survive, and installs are rare.
+
+A crash can interrupt this at any point. Recovery therefore checks that the
+WAL **continues** the snapshot: it must contain the snapshot's last entry
+with the same term, or start right after it. If it does not, the WAL is
+left over from before the install, and recovery finishes the job by
+removing it. So a crash never leaves the old log's entries after the new
+snapshot. A WAL that starts after the snapshot (a gap) is an error. The
+storage tests crash both kinds of snapshot write after every disk
+operation.
+
+After a restart, the node's log starts at the first stored entry. Its
+commit and applied index start at the snapshot, and the server rebuilds
+its `KvStore` from the snapshot before replaying the rest of the log.
