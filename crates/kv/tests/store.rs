@@ -281,6 +281,58 @@ fn oversized_keys_and_values_are_rejected() {
 }
 
 #[test]
+fn a_restored_store_still_recognizes_retries() {
+    let mut log = Log::new();
+    let c = log.register();
+    log.request(c, 1, put("k", "v1"));
+    assert_eq!(
+        log.request(c, 2, cas("k", Some("v1"), "v2")),
+        Response::Swapped {
+            succeeded: true,
+            previous: Some(b"v1".to_vec())
+        }
+    );
+
+    let snapshot = log.store.snapshot();
+    log.store = KvStore::restore(KvConfig::default(), &snapshot).expect("valid snapshot");
+    assert_eq!(log.store.session_count(), 1);
+    assert_eq!(log.store.get(b"k"), Some(&b"v2"[..]));
+    // Without the session table, this retry would apply the swap again and
+    // fail, because the value is no longer v1.
+    assert_eq!(
+        log.request(c, 2, cas("k", Some("v1"), "v2")),
+        Response::Swapped {
+            succeeded: true,
+            previous: Some(b"v1".to_vec())
+        }
+    );
+    assert_eq!(
+        log.request(c, 1, put("k", "old")),
+        Response::Rejected(Rejection::StaleSequence)
+    );
+}
+
+#[test]
+fn damaged_snapshots_are_rejected() {
+    let mut log = Log::new();
+    let c = log.register();
+    log.request(c, 1, put("k", "v"));
+    let snapshot = log.store.snapshot();
+    for len in 0..snapshot.len() {
+        assert!(
+            KvStore::restore(KvConfig::default(), &snapshot[..len]).is_err(),
+            "a snapshot cut to {len} bytes was accepted"
+        );
+    }
+    let mut trailing = snapshot.clone();
+    trailing.push(0);
+    assert!(KvStore::restore(KvConfig::default(), &trailing).is_err());
+    let mut version = snapshot;
+    version[0] = 9;
+    assert!(KvStore::restore(KvConfig::default(), &version).is_err());
+}
+
+#[test]
 fn malformed_entries_are_rejected_without_changing_state() {
     let mut store = KvStore::new(KvConfig::default());
     let before = store.clone();
@@ -400,16 +452,24 @@ impl Client {
 proptest! {
     /// Random workloads with retries: the store must behave exactly like a
     /// plain map in which every request is applied once, and two stores fed
-    /// the same log must stay identical.
+    /// the same log must stay identical, even if one of them is restored
+    /// from its own snapshot part-way.
     #[test]
-    fn matches_a_plain_map_and_is_deterministic(steps in steps()) {
+    fn matches_a_plain_map_and_is_deterministic(
+        steps in steps(),
+        restore_at in any::<prop::sample::Index>(),
+    ) {
+        let restore_at = restore_at.index(steps.len().max(1));
         let config = KvConfig { session_timeout_ms: 1_000_000, ..KvConfig::default() };
         let mut log = Log::with_config(config);
         let mut replica = KvStore::new(config);
         let mut model = BTreeMap::new();
         let mut clients: Vec<Client> = Vec::new();
 
-        for step in steps {
+        for (number, step) in steps.into_iter().enumerate() {
+            if number == restore_at {
+                replica = KvStore::restore(config, &replica.snapshot()).expect("valid snapshot");
+            }
             let (command, expected) = match step {
                 Step::Register => (Command::RegisterClient, None),
                 Step::AdvanceClock(ms) => {

@@ -1,8 +1,9 @@
 //! The replicated key-value state machine.
 
-use std::collections::BTreeMap;
+use imbl::OrdMap;
 
-use crate::command::{ClientId, Command, Envelope, Operation};
+use crate::command::{ClientId, Command, DecodeError, Envelope, Operation};
+use crate::snapshot;
 
 /// Limits and timeouts of the state machine. Every node must use the same
 /// values, or their states could diverge.
@@ -75,10 +76,10 @@ pub enum Rejection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Session {
-    sequence: u64,
-    response: Response,
-    active_at_ms: u64,
+pub(crate) struct Session {
+    pub(crate) sequence: u64,
+    pub(crate) response: Response,
+    pub(crate) active_at_ms: u64,
 }
 
 /// The key-value state machine.
@@ -93,16 +94,21 @@ struct Session {
 /// sequence number and response; a retry of that request gets the remembered
 /// response instead of being applied again. Without this, a client that
 /// retries after a leader change could apply the same write twice.
+///
+/// **Snapshots** contain the data and the session table: a node restored
+/// from a snapshot without its sessions would apply retried requests again.
+/// The maps are persistent (`imbl`), so cloning a store is cheap and a
+/// clone can be serialized on another thread while this one keeps applying.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KvStore {
-    config: KvConfig,
-    data: BTreeMap<Vec<u8>, Vec<u8>>,
-    sessions: BTreeMap<ClientId, Session>,
+    pub(crate) config: KvConfig,
+    pub(crate) data: OrdMap<Vec<u8>, Vec<u8>>,
+    pub(crate) sessions: OrdMap<ClientId, Session>,
     /// The latest leader timestamp seen. Never moves backwards, even if a new
     /// leader's clock is behind the previous one.
-    clock_ms: u64,
+    pub(crate) clock_ms: u64,
     /// When idle sessions were last removed.
-    last_sweep_ms: u64,
+    pub(crate) last_sweep_ms: u64,
 }
 
 impl KvStore {
@@ -118,6 +124,20 @@ impl KvStore {
     /// The store's limits and timeouts.
     pub fn config(&self) -> &KvConfig {
         &self.config
+    }
+
+    /// Serializes the whole state: data, sessions and logical clock.
+    ///
+    /// Takes time proportional to the store's size. Clone the store first
+    /// (cheap) to serialize it without holding up the apply loop.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        snapshot::encode(self)
+    }
+
+    /// Rebuilds a store from [`snapshot`](Self::snapshot)'s output.
+    pub fn restore(config: KvConfig, bytes: &[u8]) -> Result<Self, DecodeError> {
+        snapshot::decode(config, bytes)
     }
 
     /// Applies the command in the log entry at `index`.
@@ -241,7 +261,15 @@ impl KvStore {
         }
         self.last_sweep_ms = self.clock_ms;
         let deadline = self.clock_ms.saturating_sub(self.config.session_timeout_ms);
-        self.sessions.retain(|_, s| s.active_at_ms >= deadline);
+        let expired: Vec<ClientId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.active_at_ms < deadline)
+            .map(|(&client_id, _)| client_id)
+            .collect();
+        for client_id in expired {
+            self.sessions.remove(&client_id);
+        }
     }
 
     /// Reads a key from local state. Callers must make sure the read is

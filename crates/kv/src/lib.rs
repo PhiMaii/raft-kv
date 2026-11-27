@@ -9,9 +9,11 @@
 //! the log. Clients normally read with `ReadIndex` instead, which bypasses
 //! the log; log reads remain for comparison in benchmarks.
 //! Client sessions deduplicate retried requests, so a write is never applied
-//! twice.
+//! twice. A store serializes into a snapshot, sessions included, for log
+//! compaction.
 
 mod command;
+mod snapshot;
 mod store;
 
 pub use command::{ClientId, Command, DecodeError, Envelope, Operation};
