@@ -2,9 +2,12 @@
 //!
 //! The log may start after a snapshot: entries up to and including
 //! `snapshot_index` have been compacted away, and only their last index and
-//! term are kept. Every lookup goes through that offset, so snapshots
-//! (milestone 11) do not require changing how the rest of the protocol
-//! addresses the log.
+//! term are kept. Every lookup goes through that offset.
+//!
+//! The log's start need not be the latest snapshot's index: a node keeps a
+//! tail of entries before its snapshot, so that followers that are only a
+//! little behind can catch up from the log instead of receiving the whole
+//! snapshot.
 
 use std::fmt;
 
@@ -219,6 +222,28 @@ impl Log {
         }
     }
 
+    /// Drops every entry up to and including `index`, which becomes the new
+    /// start of the log. Entries after it are kept.
+    ///
+    /// Does nothing if `index` is not after the current start.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is past the end of the log: the term of the new
+    /// start must be known.
+    pub fn compact_to(&mut self, index: LogIndex) {
+        if index <= self.snapshot_index {
+            return;
+        }
+        let term = self
+            .term_at(index)
+            .expect("cannot compact past the end of the log");
+        let pos = self.position(index).expect("index is stored");
+        self.entries.drain(..=pos);
+        self.snapshot_index = index;
+        self.snapshot_term = term;
+    }
+
     /// Appends an entry to the end of the log.
     ///
     /// # Panics
@@ -370,6 +395,31 @@ mod tests {
         assert_eq!(log.last_index(), LogIndex(2));
         log.append(entry(3, 5));
         assert_eq!(log.last_term(), Term(5));
+    }
+
+    #[test]
+    fn compaction_keeps_the_entries_after_the_new_start() {
+        let mut log = log_with_terms(&[1, 1, 2, 2, 3]);
+        log.compact_to(LogIndex(3));
+        assert_eq!(log.snapshot_index(), LogIndex(3));
+        assert_eq!(log.snapshot_term(), Term(2));
+        assert_eq!(log.first_index(), LogIndex(4));
+        assert_eq!(log.entries(), &[entry(4, 2), entry(5, 3)]);
+        // Compacting to an earlier point changes nothing.
+        log.compact_to(LogIndex(2));
+        assert_eq!(log.snapshot_index(), LogIndex(3));
+        // Compacting everything leaves only the position.
+        log.compact_to(LogIndex(5));
+        assert_eq!(log.last_index(), LogIndex(5));
+        assert_eq!(log.last_term(), Term(3));
+        assert_eq!(log.entries(), &[] as &[Entry]);
+    }
+
+    #[test]
+    #[should_panic(expected = "end of the log")]
+    fn compaction_past_the_end_is_refused() {
+        let mut log = log_with_terms(&[1, 1]);
+        log.compact_to(LogIndex(3));
     }
 
     #[test]

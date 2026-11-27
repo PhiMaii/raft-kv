@@ -25,6 +25,12 @@ pub struct Config {
     /// The most entries a single `AppendEntries` message may carry, so a
     /// follower that is far behind catches up in bounded steps.
     pub max_entries_per_append: usize,
+    /// The most snapshot bytes a single `InstallSnapshot` message may carry.
+    pub snapshot_chunk_size: usize,
+    /// How many entries before a snapshot to keep in the log when it is
+    /// compacted, so that followers that are only slightly behind catch up
+    /// from the log instead of receiving the whole snapshot.
+    pub retained_entries: u64,
     /// Seed for the node's random number generator, which only picks
     /// election timeouts. The same seed always gives the same behaviour.
     pub seed: u64,
@@ -42,6 +48,8 @@ impl Config {
             election_timeout_max: 30,
             heartbeat_interval: 5,
             max_entries_per_append: 1024,
+            snapshot_chunk_size: 1 << 20,
+            retained_entries: 1024,
             seed,
         }
     }
@@ -67,6 +75,9 @@ impl Config {
         if self.max_entries_per_append == 0 {
             return Err(ConfigError::ZeroMaxEntriesPerAppend);
         }
+        if self.snapshot_chunk_size == 0 {
+            return Err(ConfigError::ZeroSnapshotChunkSize);
+        }
         Ok(())
     }
 }
@@ -86,6 +97,8 @@ pub enum ConfigError {
     HeartbeatNotShorterThanElectionTimeout,
     /// `max_entries_per_append` is zero.
     ZeroMaxEntriesPerAppend,
+    /// `snapshot_chunk_size` is zero.
+    ZeroSnapshotChunkSize,
 }
 
 impl fmt::Display for ConfigError {
@@ -101,6 +114,7 @@ impl fmt::Display for ConfigError {
                 "heartbeat interval must be shorter than the minimum election timeout"
             }
             Self::ZeroMaxEntriesPerAppend => "max entries per append must be at least one",
+            Self::ZeroSnapshotChunkSize => "snapshot chunk size must be at least one byte",
         };
         f.write_str(message)
     }
@@ -145,8 +159,12 @@ mod tests {
             Err(ConfigError::HeartbeatNotShorterThanElectionTimeout)
         );
 
-        let mut c = base;
+        let mut c = base.clone();
         c.max_entries_per_append = 0;
         assert_eq!(c.validate(), Err(ConfigError::ZeroMaxEntriesPerAppend));
+
+        let mut c = base;
+        c.snapshot_chunk_size = 0;
+        assert_eq!(c.validate(), Err(ConfigError::ZeroSnapshotChunkSize));
     }
 }
