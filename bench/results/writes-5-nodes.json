@@ -1,0 +1,46 @@
+{
+  "config": {
+    "cluster": [
+      "127.0.0.1:7201",
+      "127.0.0.1:7202",
+      "127.0.0.1:7203",
+      "127.0.0.1:7204",
+      "127.0.0.1:7205"
+    ],
+    "clients": 32,
+    "duration": 20.0,
+    "warmup": 5.0,
+    "read_percent": 0,
+    "keys": 1000,
+    "value_size": 100
+  },
+  "environment": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpu": "Apple M3",
+    "cpus": 8,
+    "memory_gib": 16,
+    "git_commit": "9f3de5e",
+    "timestamp": 1795810320
+  },
+  "throughput": 1273.55,
+  "reads": {
+    "count": 0,
+    "throughput": 0.0,
+    "mean_us": 0.0,
+    "p50_us": 0,
+    "p99_us": 0,
+    "p999_us": 0,
+    "max_us": 0
+  },
+  "writes": {
+    "count": 25471,
+    "throughput": 1273.55,
+    "mean_us": 25110.659809194778,
+    "p50_us": 24799,
+    "p99_us": 41887,
+    "p999_us": 104063,
+    "max_us": 104831
+  },
+  "errors": 0
+}

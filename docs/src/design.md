@@ -161,8 +161,9 @@ fault-free simulations it cuts the entries sent per committed entry by
 40–50 %. It can add up to one round trip of latency to a write that arrives
 just after a send, so with clients that each wait for their last answer,
 the unbatched mode commits 15–20 % more. Allowing several appends in flight (pipelining, as etcd does)
-would remove that cost; whether it is worth the extra state is a question
-for the benchmarks.
+would remove that cost. On one machine the [benchmarks](benchmarks.md) show
+no difference beyond run-to-run noise either way, because every node's
+fsync waits on the same disk; the question needs separate machines.
 
 **The leader's fsync overlaps with the network** (`send_before_persist`,
 Raft dissertation §10.2.1). A leader's `AppendEntries` carry its own log and

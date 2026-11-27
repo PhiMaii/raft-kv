@@ -136,6 +136,10 @@ raft-kv is tested at four levels:
   the leader compacted its log catches up through `InstallSnapshot`, and
   the whole cluster restarts from its snapshots without losing a write; a
   node without its data directory refuses to start.
+- **Benchmark test** (`crates/bench/tests/run.rs`): a two-second run
+  against three nodes in the test process measures reads and writes,
+  reports ordered percentiles and about the requested read share, and
+  serializes to JSON.
 - **Process tests** (`crates/cli/tests/cluster.rs`): five real
   `raft-kv server` processes, driven through the `raft-kv` command line.
   They elect a leader and serve every operation; the leader is killed with
