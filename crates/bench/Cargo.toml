@@ -8,5 +8,17 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+client = { path = "../client" }
+hdrhistogram = { version = "7", default-features = false }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+serde_json = "1"
+server = { path = "../server" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
 [lints]
 workspace = true

@@ -13,9 +13,11 @@ name = "raft-kv"
 path = "src/main.rs"
 
 [dependencies]
+bench = { path = "../bench" }
 clap = { version = "4", features = ["derive", "env"] }
 client = { path = "../client" }
 raft-core = { path = "../raft-core" }
+serde_json = "1"
 server = { path = "../server" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"

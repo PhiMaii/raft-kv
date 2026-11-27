@@ -112,8 +112,21 @@ invariants, and how the simulator was checked against known Raft bugs.
 
 ## Results
 
-_TBD._ Every number published here will come with the exact command and the
-hardware it was measured on, so it can be reproduced from this repository.
+Three nodes on one laptop (Apple M3, internal SSD, real `F_FULLFSYNC`),
+32 closed-loop clients, 100-byte values:
+
+| Workload | Throughput | p50 | p99 |
+|---|---|---|---|
+| Writes only | 1,620 ops/s | 19.6 ms | 30.1 ms |
+| 95 % reads (ReadIndex) | 4,169 ops/s | 6.9 ms (reads) | 20.8 ms (reads) |
+| 95 % reads through the log | 1,593 ops/s | 19.7 ms (reads) | 32.1 ms (reads) |
+| Writes, 128 clients | 5,949 ops/s | 21.1 ms | 49.4 ms |
+
+All three nodes share one SSD, and syncs from different processes queue
+behind each other, so these numbers say more about the laptop's disk than
+about a deployed cluster. [Benchmarks](docs/src/benchmarks.md) has every
+scenario, the analysis, and the exact command to reproduce them:
+`scripts/bench.sh matrix`.
 
 ## Documentation
 

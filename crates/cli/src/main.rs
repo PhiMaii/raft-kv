@@ -3,6 +3,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use client::{Client, ClientConfig};
@@ -74,6 +75,38 @@ enum Commands {
         #[command(flatten)]
         cluster: ClusterArgs,
     },
+    /// Measure throughput and latency against a running cluster.
+    Bench {
+        #[command(flatten)]
+        cluster: ClusterArgs,
+        #[command(flatten)]
+        options: BenchArgs,
+    },
+}
+
+#[derive(Debug, Args)]
+struct BenchArgs {
+    /// Concurrent clients, each with one request in flight.
+    #[arg(long, default_value_t = 32)]
+    clients: usize,
+    /// Seconds to measure, after the warm-up.
+    #[arg(long, default_value_t = 20.0)]
+    duration: f64,
+    /// Seconds to run before measuring.
+    #[arg(long, default_value_t = 5.0)]
+    warmup: f64,
+    /// Percentage of operations that are reads; the rest are writes.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u8).range(0..=100))]
+    reads: u8,
+    /// Number of distinct keys.
+    #[arg(long, default_value_t = 1_000)]
+    keys: u64,
+    /// Size of each written value, in bytes.
+    #[arg(long, default_value_t = 100)]
+    value_size: usize,
+    /// Also write the full report, as JSON, to this file.
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -186,6 +219,61 @@ async fn run(command: Commands) -> Result<ExitCode, Box<dyn std::error::Error>> 
             status(&cluster.cluster).await;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Bench { cluster, options } => run_bench(cluster, options).await,
+    }
+}
+
+async fn run_bench(
+    cluster: ClusterArgs,
+    options: BenchArgs,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let config = bench::BenchConfig {
+        cluster: cluster.cluster,
+        clients: options.clients,
+        duration: Duration::try_from_secs_f64(options.duration)?,
+        warmup: Duration::try_from_secs_f64(options.warmup)?,
+        read_percent: options.reads,
+        keys: options.keys,
+        value_size: options.value_size,
+    };
+    eprintln!(
+        "{} clients, {}% reads, {} keys, {} B values: {:.0} s warm-up, then {:.0} s measured",
+        config.clients,
+        config.read_percent,
+        config.keys,
+        config.value_size,
+        config.warmup.as_secs_f64(),
+        config.duration.as_secs_f64()
+    );
+    let report = bench::run(config).await?;
+    print_report(&report);
+    if let Some(path) = options.output {
+        std::fs::write(&path, serde_json::to_string_pretty(&report)? + "\n")?;
+        eprintln!("report written to {}", path.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_report(report: &bench::Report) {
+    println!("throughput: {:.0} ops/s", report.throughput);
+    println!(
+        "{:<6} {:>9} {:>10} {:>9} {:>9} {:>9} {:>9}",
+        "", "ops", "ops/s", "p50 ms", "p99 ms", "p99.9 ms", "max ms"
+    );
+    for (name, latency) in [("reads", &report.reads), ("writes", &report.writes)] {
+        let ms = |us: u64| Duration::from_micros(us).as_secs_f64() * 1000.0;
+        println!(
+            "{name:<6} {:>9} {:>10.0} {:>9.2} {:>9.2} {:>9.2} {:>9.2}",
+            latency.count,
+            latency.throughput,
+            ms(latency.p50_us),
+            ms(latency.p99_us),
+            ms(latency.p999_us),
+            ms(latency.max_us)
+        );
+    }
+    if report.errors > 0 {
+        println!("errors: {}", report.errors);
     }
 }
 

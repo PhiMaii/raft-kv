@@ -101,6 +101,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   appends.
 - `sim`: every seed turns batching and early sends on or off, and counts
   the entries sent.
+- `bench` and `raft-kv bench`: a closed-loop load generator with one
+  session per client, a configurable read/write mix, a warm-up, HDR
+  histograms per operation type, and a JSON report with the configuration,
+  the machine and the commit.
+- `scripts/bench.sh` runs each benchmark scenario against a fresh cluster
+  with its own server settings; `scripts/fsync-probe.py` measures how long
+  a sync takes with one or several processes on the same disk. Results are
+  in `bench/results/` and on the Benchmarks page.
 - A local five-node cluster: `scripts/cluster.sh` (start, stop, kill and
   restart single nodes, status, logs, clean), `docker-compose.yml` with a
   `Dockerfile`, and example configurations in `config/`.
