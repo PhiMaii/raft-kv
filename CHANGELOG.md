@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- CI: a Docker workflow that builds the image, starts the Compose cluster,
+  crashes the leader and checks reads and writes (`scripts/docker-smoke-test.sh`).
 - `raft-core`: leader election (Raft §5.2) with the election restriction
   (§5.4.1), randomized election timeouts from a seeded generator, heartbeats,
   and a `tick` / `step` / `take_ready` API that performs no I/O.

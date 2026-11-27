@@ -361,3 +361,8 @@ scripts/sim-mutations.sh 1000
 
 A nightly CI job runs 10,000 new seeds every night, starting at a different
 offset each time.
+
+The Docker setup is smoke-tested in CI as well: whenever the image, the
+Compose file or the code changes, `scripts/docker-smoke-test.sh` builds the
+image, starts the five-node cluster, kills the leader and checks that reads
+and writes still succeed and that the restarted node rejoins as a follower.
