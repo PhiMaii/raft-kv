@@ -56,6 +56,32 @@ pub(crate) fn encode_message(message: &Message) -> wire::RaftMessage {
             conflict_term: conflict_term.map(|term| term.0),
             read_round: *read_round,
         }),
+        MessageBody::InstallSnapshot {
+            index,
+            term,
+            offset,
+            total,
+            data,
+            read_round,
+        } => wire::raft_message::Body::InstallSnapshot(wire::InstallSnapshot {
+            index: index.0,
+            term: term.0,
+            offset: *offset,
+            total: *total,
+            data: data.clone(),
+            read_round: *read_round,
+        }),
+        MessageBody::InstallSnapshotResponse {
+            index,
+            received,
+            done,
+            read_round,
+        } => wire::raft_message::Body::InstallSnapshotResponse(wire::InstallSnapshotResponse {
+            index: index.0,
+            received: *received,
+            done: *done,
+            read_round: *read_round,
+        }),
     };
     wire::RaftMessage {
         from: message.from.0,
@@ -93,6 +119,22 @@ pub(crate) fn decode_message(message: wire::RaftMessage) -> Result<Message, Inva
                 match_index: LogIndex(response.match_index),
                 conflict_index: LogIndex(response.conflict_index),
                 conflict_term: response.conflict_term.map(Term),
+                read_round: response.read_round,
+            }
+        }
+        wire::raft_message::Body::InstallSnapshot(install) => MessageBody::InstallSnapshot {
+            index: LogIndex(install.index),
+            term: Term(install.term),
+            offset: install.offset,
+            total: install.total,
+            data: install.data,
+            read_round: install.read_round,
+        },
+        wire::raft_message::Body::InstallSnapshotResponse(response) => {
+            MessageBody::InstallSnapshotResponse {
+                index: LogIndex(response.index),
+                received: response.received,
+                done: response.done,
                 read_round: response.read_round,
             }
         }
@@ -196,6 +238,20 @@ mod tests {
                 conflict_index: LogIndex(4),
                 conflict_term: Some(Term(0)),
                 read_round: 3,
+            },
+            MessageBody::InstallSnapshot {
+                index: LogIndex(40),
+                term: Term(6),
+                offset: 1024,
+                total: 4096,
+                data: vec![7; 1024],
+                read_round: 2,
+            },
+            MessageBody::InstallSnapshotResponse {
+                index: LogIndex(40),
+                received: 2048,
+                done: false,
+                read_round: 2,
             },
         ];
         for body in bodies {
